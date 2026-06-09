@@ -308,58 +308,15 @@ class handler(BaseHTTPRequestHandler):
                 return
 
             v = video_track
-            a = audio_track
-            v_rep = v["rep"]
-            v_codecs = v_rep.get("codecs", "avc1.64001f")
-            width = v_rep.get("width", v["adapt"].get("width", "1280"))
-            height = v_rep.get("height", v["adapt"].get("height", "720"))
-            bandwidth = v_rep.get("bandwidth", "2500000")
 
-            if track_type == "video":
-                pl = build_media_playlist(v["segs"], v["init_url"], is_live, v["timescale"])
-                if pl is None:
-                    self._send(500, "text/plain", "Error: No video segments.")
-                    return
-                self._send(200, "application/vnd.apple.mpegurl", pl)
-
-            elif track_type == "audio":
-                if a is None:
-                    self._send(404, "text/plain", "No audio track available.")
-                    return
-                pl = build_media_playlist(a["segs"], a["init_url"], is_live, a["timescale"])
-                if pl is None:
-                    self._send(500, "text/plain", "Error: No audio segments.")
-                    return
-                self._send(200, "application/vnd.apple.mpegurl", pl)
-
-            else:
-                # Master playlist
-                a_codecs = a["rep"].get("codecs", "mp4a.40.2") if a else "mp4a.40.2"
-                combined_codecs = f"{v_codecs},{a_codecs}" if a else v_codecs
-
-                audio_uri = f"/{channel}.m3u8?type=audio"
-                video_uri = f"/{channel}.m3u8?type=video"
-
-                lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
-                if a:
-                    lang = a.get("lang", "und")
-                    lines.append(
-                        f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",LANGUAGE="{lang}",'
-                        f'NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="{audio_uri}"'
-                    )
-                    lines.append(
-                        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},'
-                        f'CODECS="{combined_codecs}",'
-                        f'RESOLUTION={width}x{height},AUDIO="audio"'
-                    )
-                else:
-                    lines.append(
-                        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},'
-                        f'CODECS="{v_codecs}",'
-                        f'RESOLUTION={width}x{height}'
-                    )
-                lines.append(video_uri)
-                self._send(200, "application/vnd.apple.mpegurl", "\n".join(lines))
+            # Serve single media playlist directly - works on all players
+            # including native browser video player and hls.js-based players.
+            # MPD segments from indihometv are already muxed (video+audio in one .m4s).
+            pl = build_media_playlist(v["segs"], v["init_url"], is_live, v["timescale"])
+            if pl is None:
+                self._send(500, "text/plain", "Error: No video segments.")
+                return
+            self._send(200, "application/vnd.apple.mpegurl", pl)
 
         except Exception as e:
             self._send(500, "text/plain", f"Error: {str(e)}")
