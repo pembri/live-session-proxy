@@ -3,6 +3,7 @@ import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler
 import urllib.request
 from urllib.parse import urlparse, parse_qs
+import time
 
 CHANNELS = {
     "btv": "https://cdnbal1.indihometv.com/atm/DASH/beritasatu/beritasatu-avc1_2500000=7-3277707030000000.mpd",
@@ -110,39 +111,43 @@ CHANNELS = {
 
 NS = "urn:mpeg:dash:schema:mpd:2011"
 
-def parse_segment_timeline(seg_template, rep_id, base_url, timescale, pto):
+def parse_segment_timeline(seg_template, rep_id, base_url, timescale):
     media_pattern = seg_template.get("media", "")
     seg_timeline = seg_template.find(f"{{{NS}}}SegmentTimeline")
     if seg_timeline is None:
         return []
 
+    first_s = seg_timeline.find(f"{{{NS}}}S")
+    if first_s is None: 
+        return []
+        
+    first_t = int(first_s.get("t", "0"))
+    first_d = int(first_s.get("d", "1"))
+    
+    # [FIX KETIGA] Menjamin urutan Media Sequence absolut yang selalu bertambah 1
+    base_seq = first_t // first_d
+    
     segments = []
-    current_t = 0
-    first_d = 1
-    is_first = True
-
+    current_t = first_t
+    seg_index = 0
+    
     for s in seg_timeline.findall(f"{{{NS}}}S"):
         t = s.get("t")
-        d = int(s.get("d"))
-        r = int(s.get("r", "0"))
-        
         if t is not None:
             current_t = int(t)
-            
-        if is_first:
-            first_d = d if d > 0 else 1
-            is_first = False
+        
+        d = int(s.get("d", first_d))
+        r = int(s.get("r", "0"))
 
         for _ in range(r + 1):
             seg_name = media_pattern.replace("$RepresentationID$", rep_id).replace("$Time$", str(current_t))
             seg_url = base_url + seg_name
             duration = d / timescale
-            
-            # [FIX] Kalkulasi Media Sequence yang absolut berdasarkan waktu
-            seq_num = current_t // first_d 
+            seq_num = base_seq + seg_index
             
             segments.append((seg_url, duration, seq_num))
             current_t += d
+            seg_index += 1
 
     return segments
 
@@ -150,7 +155,15 @@ def get_base_url(mpd_url):
     return mpd_url.rsplit("/", 1)[0] + "/"
 
 def mpd_to_m3u8(mpd_url, track='master', base_path=''):
-    req = urllib.request.Request(mpd_url, headers={"User-Agent": "Mozilla/5.0"})
+    # [FIX PERTAMA] CACHE BUSTER! Mencegah Vercel dan Indihome memberikan file .mpd masa lalu
+    mpd_url_nocache = f"{mpd_url}?_cb={int(time.time() * 1000)}"
+    
+    req = urllib.request.Request(mpd_url_nocache, headers={
+        "User-Agent": "Mozilla/5.0",
+        "Cache-Control": "no-cache, no-store, must-revalidate",
+        "Pragma": "no-cache"
+    })
+    
     with urllib.request.urlopen(req, timeout=10) as resp:
         mpd_content = resp.read()
 
@@ -158,11 +171,11 @@ def mpd_to_m3u8(mpd_url, track='master', base_path=''):
     base_url = get_base_url(mpd_url)
 
     best_v_rep = best_v_seg_tmpl = None
-    best_v_bw = best_v_pto = 0
+    best_v_bw = 0
     best_v_timescale = 1
 
     best_a_rep = best_a_seg_tmpl = None
-    best_a_bw = best_a_pto = 0
+    best_a_bw = 0
     best_a_timescale = 1
 
     for period in root.findall(f"{{{NS}}}Period"):
@@ -184,20 +197,17 @@ def mpd_to_m3u8(mpd_url, track='master', base_path=''):
                     continue
 
                 timescale = int(actual_seg_tmpl.get("timescale", "1"))
-                pto = int(actual_seg_tmpl.get("presentationTimeOffset", "0"))
 
                 if is_video and bw > best_v_bw:
                     best_v_rep = rep
                     best_v_bw = bw
                     best_v_seg_tmpl = actual_seg_tmpl
                     best_v_timescale = timescale
-                    best_v_pto = pto
                 elif is_audio and bw > best_a_bw:
                     best_a_rep = rep
                     best_a_bw = bw
                     best_a_seg_tmpl = actual_seg_tmpl
                     best_a_timescale = timescale
-                    best_a_pto = pto
 
     if track == 'master':
         if best_v_rep is None:
@@ -207,7 +217,7 @@ def mpd_to_m3u8(mpd_url, track='master', base_path=''):
         width = best_v_rep.get("width", "1280")
         height = best_v_rep.get("height", "720")
 
-        lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
+        lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
 
         if best_a_rep is not None:
             a_codecs = best_a_rep.get("codecs", "mp4a.40.2")
@@ -224,7 +234,6 @@ def mpd_to_m3u8(mpd_url, track='master', base_path=''):
     target_rep = best_v_rep if is_video_track else best_a_rep
     target_tmpl = best_v_seg_tmpl if is_video_track else best_a_seg_tmpl
     target_timescale = best_v_timescale if is_video_track else best_a_timescale
-    target_pto = best_v_pto if is_video_track else best_a_pto
 
     if target_rep is None:
         return None, f"No {track} representation found in MPD"
@@ -233,25 +242,27 @@ def mpd_to_m3u8(mpd_url, track='master', base_path=''):
     init_pattern = target_tmpl.get("initialization", "")
     init_url = base_url + init_pattern.replace("$RepresentationID$", rep_id)
 
-    segments = parse_segment_timeline(target_tmpl, rep_id, base_url, target_timescale, target_pto)
+    segments = parse_segment_timeline(target_tmpl, rep_id, base_url, target_timescale)
 
     if not segments:
         return None, "No segments found"
 
-    # [FIX] Trik Anti-Looping: Ambil hanya 5 segmen terakhir (Live Edge)
     LIVE_WINDOW = 5
     if len(segments) > LIVE_WINDOW:
         live_segments = segments[-LIVE_WINDOW:]
     else:
         live_segments = segments
 
-    # Ambil sequence number dari segmen pertama di live window
     media_seq = live_segments[0][2]
+    
+    # [FIX KEDUA] Kalkulasi Target Duration yang lebih pas
+    max_duration = max([s[1] for s in live_segments])
+    target_duration = int(max_duration + 1)
 
     media_lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:7",
-        "#EXT-X-TARGETDURATION:4",
+        f"#EXT-X-TARGETDURATION:{target_duration}",
         f"#EXT-X-MEDIA-SEQUENCE:{media_seq}", 
         f'#EXT-X-MAP:URI="{init_url}"'
     ]
@@ -301,8 +312,8 @@ class handler(BaseHTTPRequestHandler):
             self.send_header("Content-Type", "application/vnd.apple.mpegurl")
             self.send_header("Access-Control-Allow-Origin", "*")
             
-            # [FIX] Matikan cache Vercel secara paksa dan agresif
-            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0")
+            # [FIX KEEMPAT] Menginstruksikan CDN Vercel agar 100% bypass cache
+            self.send_header("Cache-Control", "public, s-maxage=0, max-age=0, must-revalidate, proxy-revalidate, no-cache, no-store")
             self.send_header("Pragma", "no-cache")
             self.send_header("Expires", "0")
             
