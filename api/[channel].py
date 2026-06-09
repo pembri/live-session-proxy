@@ -205,7 +205,8 @@ def build_media_playlist(segs, init_url, is_live, timescale):
     prev_t = None
     for seg_url, duration, t in segs:
         if prev_t is not None and seg_d_ticks > 0:
-            if abs(t - (prev_t + seg_d_ticks)) > seg_d_ticks * 1.5:
+            expected_t = prev_t + seg_d_ticks
+            if abs(t - expected_t) > seg_d_ticks * 1.5:
                 lines.append("#EXT-X-DISCONTINUITY")
         lines.append(f"#EXTINF:{duration:.5f},")
         lines.append(seg_url)
@@ -272,6 +273,10 @@ class handler(BaseHTTPRequestHandler):
         mpd_url = CHANNELS[channel]
         track_type = qs.get("type", [None])[0]
 
+        host = self.headers.get("Host", "")
+        scheme = self.headers.get("X-Forwarded-Proto", "https") or "https"
+        proxy_base = f"{scheme}://{host}"
+
         try:
             root, base_url, is_live = parse_mpd(mpd_url)
             video_track, audio_track = get_tracks(root, base_url)
@@ -283,8 +288,14 @@ class handler(BaseHTTPRequestHandler):
             v = video_track
             a = audio_track
 
-            if track_type == "audio":
-                # Explicit audio-only request (for capable players like VLC)
+            if track_type == "video":
+                pl = build_media_playlist(v["segs"], v["init_url"], is_live, v["timescale"])
+                if pl is None:
+                    self._send(500, "text/plain", "Error: No video segments.")
+                    return
+                self._send(200, "application/vnd.apple.mpegurl", pl)
+
+            elif track_type == "audio":
                 if a is None:
                     self._send(404, "text/plain", "No audio track.")
                     return
@@ -295,15 +306,59 @@ class handler(BaseHTTPRequestHandler):
                 self._send(200, "application/vnd.apple.mpegurl", pl)
 
             else:
-                # Default (no ?type, or ?type=video):
-                # Return the VIDEO media playlist directly — no master playlist wrapper.
-                # This is the most compatible approach for Chrome Android's native player
-                # which does not handle multi-rendition master playlists reliably.
-                pl = build_media_playlist(v["segs"], v["init_url"], is_live, v["timescale"])
-                if pl is None:
-                    self._send(500, "text/plain", "Error: No video segments.")
-                    return
-                self._send(200, "application/vnd.apple.mpegurl", pl)
+                # ── KEY FIX ───────────────────────────────────────────────────
+                # Chrome Android native <video> player does NOT support
+                # EXT-X-MEDIA audio rendition groups — it silently fails and
+                # shows black screen.
+                #
+                # Strategy: serve a master playlist that lists BOTH a muxed
+                # (video-only) variant AND uses EXT-X-MEDIA for capable players.
+                # But the default/first variant URI points to the video playlist
+                # directly — so Chrome picks it up immediately.
+                #
+                # For players that DO support audio groups (VLC, Safari, hls.js),
+                # they'll pick the audio group variant instead.
+                # ─────────────────────────────────────────────────────────────
+                v_rep = v["rep"]
+                v_codecs = v_rep.get("codecs", "avc1.64001f")
+                width = v_rep.get("width", v["adapt"].get("width", "1280"))
+                height = v_rep.get("height", v["adapt"].get("height", "720"))
+                bandwidth = v_rep.get("bandwidth", "2500000")
+                a_codecs = a["rep"].get("codecs", "mp4a.40.2") if a else "mp4a.40.2"
+
+                video_uri = f"{proxy_base}/{channel}.m3u8?type=video"
+                audio_uri = f"{proxy_base}/{channel}.m3u8?type=audio"
+
+                lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
+
+                if a:
+                    lang = a.get("lang", "und")
+                    # Audio rendition — capable players (hls.js, Safari, VLC) use this
+                    lines.append(
+                        f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",LANGUAGE="{lang}",'
+                        f'NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="{audio_uri}"'
+                    )
+                    # Variant 1: with audio group (for capable players)
+                    lines.append(
+                        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs},{a_codecs}",'
+                        f'RESOLUTION={width}x{height},AUDIO="audio"'
+                    )
+                    lines.append(video_uri)
+                    # Variant 2: video-only fallback (no AUDIO= attribute)
+                    # Chrome Android picks this when it can't handle audio groups
+                    lines.append(
+                        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs}",'
+                        f'RESOLUTION={width}x{height}'
+                    )
+                    lines.append(video_uri)
+                else:
+                    lines.append(
+                        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs}",'
+                        f'RESOLUTION={width}x{height}'
+                    )
+                    lines.append(video_uri)
+
+                self._send(200, "application/vnd.apple.mpegurl", "\n".join(lines))
 
         except Exception as e:
             self._send(500, "text/plain", f"Error: {str(e)}")
