@@ -111,6 +111,12 @@ CHANNELS = {
 
 NS = "urn:mpeg:dash:schema:mpd:2011"
 
+# ── Tuning constants ─────────────────────────────────────────────────────────
+# How many segments to keep in the live window.
+# More = bigger buffer = more stable but more delay.
+# 10 segments ≈ ~30–50 s delay (typical 3–5 s/seg), enough to hide network jitter.
+LIVE_WINDOW = 10
+
 
 def get_base_url(mpd_url):
     return mpd_url.rsplit("/", 1)[0] + "/"
@@ -195,11 +201,20 @@ def build_media_playlist(segs, init_url, is_live, timescale):
     if not segs:
         return None
 
-    if is_live and len(segs) > 5:
-        segs = segs[-5:]
+    # ── Live window: keep last LIVE_WINDOW segments ──────────────────────────
+    # Larger window = more pre-buffered content = smoother playback.
+    # Player will reload this playlist every ~target_duration seconds,
+    # so as long as LIVE_WINDOW > (round-trip latency / seg_duration) the
+    # player always has something to play next.
+    if is_live and len(segs) > LIVE_WINDOW:
+        segs = segs[-LIVE_WINDOW:]
 
     max_dur = max(d for _, d, _ in segs)
     target_dur = math.ceil(max_dur)
+
+    # ── Media sequence: derived from first segment timestamp ─────────────────
+    # Must be monotonically increasing across playlist refreshes so the
+    # player knows which segments are new vs already downloaded.
     first_t = segs[0][2]
     seg_d_ticks = int(segs[0][1] * timescale)
     media_seq = (first_t // seg_d_ticks) if seg_d_ticks > 0 else 0
@@ -209,14 +224,30 @@ def build_media_playlist(segs, init_url, is_live, timescale):
         "#EXT-X-VERSION:7",
         f"#EXT-X-TARGETDURATION:{target_dur}",
         f"#EXT-X-MEDIA-SEQUENCE:{media_seq}",
+        # EXT-X-DISCONTINUITY-SEQUENCE tells the player to expect gaps
+        # in the timestamp sequence (common when MPD is refreshed and the
+        # live window slides forward). Without this some players stall.
+        "#EXT-X-DISCONTINUITY-SEQUENCE:0",
     ]
+
     if not is_live:
         lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
 
     lines.append(f'#EXT-X-MAP:URI="{init_url}"')
-    for seg_url, duration, _ in segs:
+
+    prev_t = None
+    for seg_url, duration, t in segs:
+        # Insert discontinuity marker when there is a timestamp gap larger
+        # than 1.5× the expected segment duration.  This prevents the
+        # player from trying to extrapolate a missing piece and stalling.
+        if prev_t is not None and seg_d_ticks > 0:
+            expected_t = prev_t + seg_d_ticks
+            if abs(t - expected_t) > seg_d_ticks * 1.5:
+                lines.append("#EXT-X-DISCONTINUITY")
         lines.append(f"#EXTINF:{duration:.5f},")
         lines.append(seg_url)
+        prev_t = t
+
     if not is_live:
         lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines)
@@ -271,7 +302,6 @@ class handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
 
-        # Resolve channel name
         if "channel" in qs:
             channel = qs["channel"][0].lower()
         else:
@@ -283,12 +313,9 @@ class handler(BaseHTTPRequestHandler):
             return
 
         mpd_url = CHANNELS[channel]
-        track_type = qs.get("type", [None])[0]  # "video", "audio", or None
+        track_type = qs.get("type", [None])[0]
 
-        # FIX: Build absolute base URL from Host header so media playlist URIs
-        # resolve correctly on all players (mobile browser, VLC, etc.)
         host = self.headers.get("Host", "")
-        # Detect scheme: Vercel always serves HTTPS in production
         x_forwarded_proto = self.headers.get("X-Forwarded-Proto", "https")
         scheme = x_forwarded_proto if x_forwarded_proto else "https"
         proxy_base = f"{scheme}://{host}"
@@ -322,8 +349,6 @@ class handler(BaseHTTPRequestHandler):
                 self._send(200, "application/vnd.apple.mpegurl", pl)
 
             else:
-                # FIX: Use absolute URLs in master playlist so player can
-                # correctly fetch sub-playlists regardless of how it was opened
                 v_rep = v["rep"]
                 v_codecs = v_rep.get("codecs", "avc1.64001f")
                 width = v_rep.get("width", v["adapt"].get("width", "1280"))
@@ -331,7 +356,6 @@ class handler(BaseHTTPRequestHandler):
                 bandwidth = v_rep.get("bandwidth", "2500000")
                 a_codecs = a["rep"].get("codecs", "mp4a.40.2") if a else "mp4a.40.2"
 
-                # Absolute URLs — critical fix for mobile players
                 video_uri = f"{proxy_base}/{channel}.m3u8?type=video"
                 audio_uri = f"{proxy_base}/{channel}.m3u8?type=audio"
 
