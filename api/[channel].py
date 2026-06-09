@@ -345,7 +345,7 @@ def mpd_to_master_m3u8(mpd_url, base_request_url, channel):
                 audio_init = base_url + init_pat.replace("$RepresentationID$", rep.get("id"))
 
     if video_rep is None:
-        return None, None, "No video representation found"
+        return None, None, None, "No video representation found"
 
     video_codecs = video_rep.get("codecs", "avc1.64001f")
     audio_codecs = audio_rep.get("codecs", "mp4a.40.2") if audio_rep else "mp4a.40.2"
