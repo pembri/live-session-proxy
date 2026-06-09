@@ -117,11 +117,6 @@ def get_base_url(mpd_url):
 
 
 def detect_track_type(adapt, rep):
-    """
-    Detect whether AdaptationSet is video or audio.
-    Tries mimeType, contentType, then codecs string, then width presence.
-    Returns 'video', 'audio', or None.
-    """
     mime = adapt.get("mimeType", "")
     content_type = adapt.get("contentType", "")
     codecs = rep.get("codecs", adapt.get("codecs", ""))
@@ -131,7 +126,6 @@ def detect_track_type(adapt, rep):
     if "audio" in mime or "audio" in content_type:
         return "audio"
 
-    # Fallback: codecs-based detection
     video_prefixes = ("avc", "hvc", "hev", "vp8", "vp9", "av01")
     audio_prefixes = ("mp4a", "ac-3", "ec-3", "opus", "vorbis")
 
@@ -141,7 +135,6 @@ def detect_track_type(adapt, rep):
     if any(codecs_lower.startswith(p) for p in audio_prefixes):
         return "audio"
 
-    # Last resort: presence of width/height = video
     if rep.get("width") or rep.get("height") or adapt.get("width") or adapt.get("height"):
         return "video"
 
@@ -149,10 +142,6 @@ def detect_track_type(adapt, rep):
 
 
 def pick_best_rep(adapt):
-    """
-    Pick Representation with highest bandwidth from AdaptationSet.
-    Returns (rep, seg_template, timescale) or None.
-    """
     seg_tmpl_adapt = adapt.find(f"{{{NS}}}SegmentTemplate")
     ts_adapt = int(seg_tmpl_adapt.get("timescale", "1")) if seg_tmpl_adapt is not None else 1
 
@@ -206,8 +195,6 @@ def build_media_playlist(segs, init_url, is_live, timescale):
     if not segs:
         return None
 
-    # For live: only keep last 5 segments to stay at live edge
-    # reduces buffering by not loading stale segments
     if is_live and len(segs) > 5:
         segs = segs[-5:]
 
@@ -236,9 +223,6 @@ def build_media_playlist(segs, init_url, is_live, timescale):
 
 
 def parse_mpd(mpd_url):
-    """
-    Fetches MPD and returns (root, base_url, is_live).
-    """
     req = urllib.request.Request(mpd_url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         content = resp.read()
@@ -249,11 +233,6 @@ def parse_mpd(mpd_url):
 
 
 def get_tracks(root, base_url):
-    """
-    Returns (video_track, audio_track) each as dict with keys:
-      rep, seg_tmpl, timescale, init_url, segs
-    or None if not found.
-    """
     video_track = None
     audio_track = None
 
@@ -281,7 +260,7 @@ def get_tracks(root, base_url):
                                "lang": adapt.get("lang", "und")}
 
         if video_track is not None:
-            break  # only need first Period
+            break
 
     return video_track, audio_track
 
@@ -305,6 +284,14 @@ class handler(BaseHTTPRequestHandler):
 
         mpd_url = CHANNELS[channel]
         track_type = qs.get("type", [None])[0]  # "video", "audio", or None
+
+        # FIX: Build absolute base URL from Host header so media playlist URIs
+        # resolve correctly on all players (mobile browser, VLC, etc.)
+        host = self.headers.get("Host", "")
+        # Detect scheme: Vercel always serves HTTPS in production
+        x_forwarded_proto = self.headers.get("X-Forwarded-Proto", "https")
+        scheme = x_forwarded_proto if x_forwarded_proto else "https"
+        proxy_base = f"{scheme}://{host}"
 
         try:
             root, base_url, is_live = parse_mpd(mpd_url)
@@ -335,8 +322,8 @@ class handler(BaseHTTPRequestHandler):
                 self._send(200, "application/vnd.apple.mpegurl", pl)
 
             else:
-                # Default: HLS master playlist with separate audio+video tracks
-                # Chrome Android 107+ supports EXT-X-MEDIA audio tracks natively
+                # FIX: Use absolute URLs in master playlist so player can
+                # correctly fetch sub-playlists regardless of how it was opened
                 v_rep = v["rep"]
                 v_codecs = v_rep.get("codecs", "avc1.64001f")
                 width = v_rep.get("width", v["adapt"].get("width", "1280"))
@@ -344,12 +331,16 @@ class handler(BaseHTTPRequestHandler):
                 bandwidth = v_rep.get("bandwidth", "2500000")
                 a_codecs = a["rep"].get("codecs", "mp4a.40.2") if a else "mp4a.40.2"
 
+                # Absolute URLs — critical fix for mobile players
+                video_uri = f"{proxy_base}/{channel}.m3u8?type=video"
+                audio_uri = f"{proxy_base}/{channel}.m3u8?type=audio"
+
                 lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
                 if a:
                     lang = a.get("lang", "und")
                     lines.append(
                         f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",LANGUAGE="{lang}",'
-                        f'NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="/{channel}.m3u8?type=audio"'
+                        f'NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="{audio_uri}"'
                     )
                     lines.append(
                         f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs},{a_codecs}",'
@@ -359,7 +350,7 @@ class handler(BaseHTTPRequestHandler):
                     lines.append(
                         f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs}",RESOLUTION={width}x{height}'
                     )
-                lines.append(f"/{channel}.m3u8?type=video")
+                lines.append(video_uri)
                 self._send(200, "application/vnd.apple.mpegurl", "\n".join(lines))
 
         except Exception as e:
