@@ -110,9 +110,8 @@ CHANNELS = {
 }
 
 NS = "urn:mpeg:dash:schema:mpd:2011"
-WINDOW = 5       # jumlah segment yang ditampilkan (live sliding window)
-CACHE_TTL = 2    # detik cache MPD
-_cache = {}      # { mpd_url: (timestamp, mpd_bytes) }
+CACHE_TTL = 2
+_cache = {}
 
 
 def fetch_mpd(mpd_url):
@@ -132,7 +131,7 @@ def get_base_url(mpd_url):
     return mpd_url.rsplit("/", 1)[0] + "/"
 
 
-def parse_segments(seg_template, rep_id, base_url, timescale):
+def parse_segment_timeline(seg_template, rep_id, base_url, timescale, pto):
     media_pattern = seg_template.get("media", "")
     seg_timeline = seg_template.find(f"{{{NS}}}SegmentTimeline")
     if seg_timeline is None:
@@ -152,7 +151,7 @@ def parse_segments(seg_template, rep_id, base_url, timescale):
                 .replace("$Time$", str(current_t))
             seg_url = base_url + seg_name
             duration = d / timescale
-            segments.append((seg_url, duration, current_t))
+            segments.append((seg_url, duration))
             current_t += d
     return segments
 
@@ -162,39 +161,23 @@ def mpd_to_m3u8(mpd_url):
     root = ET.fromstring(mpd_bytes)
     base_url = get_base_url(mpd_url)
 
-    # Cek BaseURL element di root
-    base_url_el = root.find(f"{{{NS}}}BaseURL")
-    if base_url_el is not None and base_url_el.text:
-        bu = base_url_el.text.strip()
-        if bu.startswith("http"):
-            base_url = bu if bu.endswith("/") else bu + "/"
-
     best_rep = None
     best_bw = 0
     best_seg_template = None
     best_timescale = 1
+    best_pto = 0
 
     for period in root.findall(f"{{{NS}}}Period"):
-        # Cek BaseURL di Period
-        period_base = period.find(f"{{{NS}}}BaseURL")
-        period_base_url = base_url
-        if period_base is not None and period_base.text:
-            pb = period_base.text.strip()
-            if pb.startswith("http"):
-                period_base_url = pb if pb.endswith("/") else pb + "/"
-
         for adapt in period.findall(f"{{{NS}}}AdaptationSet"):
             mime = adapt.get("mimeType", "")
             content_type = adapt.get("contentType", "")
             if "video" not in mime and "video" not in content_type:
                 continue
-
             seg_template = adapt.find(f"{{{NS}}}SegmentTemplate")
             if seg_template is None:
                 continue
-
             timescale = int(seg_template.get("timescale", "1"))
-
+            pto = int(seg_template.get("presentationTimeOffset", "0"))
             for rep in adapt.findall(f"{{{NS}}}Representation"):
                 bw = int(rep.get("bandwidth", "0"))
                 if bw > best_bw:
@@ -203,7 +186,7 @@ def mpd_to_m3u8(mpd_url):
                     best_bw = bw
                     best_seg_template = rep_seg if rep_seg is not None else seg_template
                     best_timescale = timescale
-                    base_url = period_base_url
+                    best_pto = pto
 
     if best_rep is None:
         return None, "No video representation found"
@@ -215,32 +198,26 @@ def mpd_to_m3u8(mpd_url):
     init_pattern = best_seg_template.get("initialization", "")
     init_url = base_url + init_pattern.replace("$RepresentationID$", rep_id)
 
-    all_segments = parse_segments(best_seg_template, rep_id, base_url, best_timescale)
+    segments = parse_segment_timeline(best_seg_template, rep_id, base_url, best_timescale, best_pto)
 
-    if not all_segments:
+    if not segments:
         return None, "No segments found"
 
-    # Ambil WINDOW segment terakhir (live edge)
-    window_segs = all_segments[-WINDOW:]
-    # Media sequence = index segment pertama dalam window dari total list
-    media_seq = len(all_segments) - len(window_segs)
-
-    # Target duration = ceiling dari max durasi segment
-    max_dur = max(d for _, d, _ in window_segs)
+    max_dur = max(d for _, d in segments)
     target_dur = int(max_dur) + 1
 
-    lines = []
-    lines.append("#EXTM3U")
-    lines.append("#EXT-X-VERSION:7")
-    lines.append(f"#EXT-X-TARGETDURATION:{target_dur}")
-    lines.append(f"#EXT-X-MEDIA-SEQUENCE:{media_seq}")
-    lines.append(f'#EXT-X-MAP:URI="{init_url}"')
+    media_lines = []
+    media_lines.append("#EXTM3U")
+    media_lines.append("#EXT-X-VERSION:7")
+    media_lines.append(f"#EXT-X-TARGETDURATION:{target_dur}")
+    media_lines.append("#EXT-X-MEDIA-SEQUENCE:0")
+    media_lines.append(f'#EXT-X-MAP:URI="{init_url}"')
 
-    for seg_url, duration, _ in window_segs:
-        lines.append(f"#EXTINF:{duration:.5f},")
-        lines.append(seg_url)
+    for seg_url, duration in segments:
+        media_lines.append(f"#EXTINF:{duration:.5f},")
+        media_lines.append(seg_url)
 
-    return "\n".join(lines), None
+    return "\n".join(media_lines), None
 
 
 class handler(BaseHTTPRequestHandler):
