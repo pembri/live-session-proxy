@@ -1,9 +1,9 @@
 import re
+import math
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler
 import urllib.request
 from urllib.parse import urlparse, parse_qs
-import time
 
 CHANNELS = {
     "btv": "https://cdnbal1.indihometv.com/atm/DASH/beritasatu/beritasatu-avc1_2500000=7-3277707030000000.mpd",
@@ -111,167 +111,314 @@ CHANNELS = {
 
 NS = "urn:mpeg:dash:schema:mpd:2011"
 
-def parse_segment_timeline(seg_template, rep_id, base_url, timescale):
+
+def get_base_url(mpd_url):
+    return mpd_url.rsplit("/", 1)[0] + "/"
+
+
+def parse_segments(seg_template, rep_id, base_url, timescale):
+    """Parse SegmentTimeline into list of (url, duration_seconds)."""
     media_pattern = seg_template.get("media", "")
     seg_timeline = seg_template.find(f"{{{NS}}}SegmentTimeline")
     if seg_timeline is None:
         return []
 
-    first_s = seg_timeline.find(f"{{{NS}}}S")
-    if first_s is None: 
-        return []
-        
-    first_t = int(first_s.get("t", "0"))
-    first_d = int(first_s.get("d", "1"))
-    
-    # [FIX KETIGA] Menjamin urutan Media Sequence absolut yang selalu bertambah 1
-    base_seq = first_t // first_d
-    
     segments = []
-    current_t = first_t
-    seg_index = 0
-    
+    current_t = None
     for s in seg_timeline.findall(f"{{{NS}}}S"):
         t = s.get("t")
+        d = int(s.get("d"))
+        r = int(s.get("r", "0"))
         if t is not None:
             current_t = int(t)
-        
-        d = int(s.get("d", first_d))
-        r = int(s.get("r", "0"))
-
         for _ in range(r + 1):
-            seg_name = media_pattern.replace("$RepresentationID$", rep_id).replace("$Time$", str(current_t))
-            seg_url = base_url + seg_name
-            duration = d / timescale
-            seq_num = base_seq + seg_index
-            
-            segments.append((seg_url, duration, seq_num))
+            seg_name = (
+                media_pattern
+                .replace("$RepresentationID$", rep_id)
+                .replace("$Time$", str(current_t))
+            )
+            segments.append((base_url + seg_name, d / timescale, current_t))
             current_t += d
-            seg_index += 1
-
     return segments
 
-def get_base_url(mpd_url):
-    return mpd_url.rsplit("/", 1)[0] + "/"
 
-def mpd_to_m3u8(mpd_url, track='master', base_path=''):
-    # [FIX PERTAMA] CACHE BUSTER! Mencegah Vercel dan Indihome memberikan file .mpd masa lalu
-    mpd_url_nocache = f"{mpd_url}?_cb={int(time.time() * 1000)}"
-    
-    req = urllib.request.Request(mpd_url_nocache, headers={
-        "User-Agent": "Mozilla/5.0",
-        "Cache-Control": "no-cache, no-store, must-revalidate",
-        "Pragma": "no-cache"
-    })
-    
+def pick_best_rep(adapt, base_url):
+    """
+    From an AdaptationSet, pick the Representation with highest bandwidth.
+    Returns (rep, seg_template, timescale) or None.
+    """
+    seg_template_adapt = adapt.find(f"{{{NS}}}SegmentTemplate")
+    timescale_adapt = int(seg_template_adapt.get("timescale", "1")) if seg_template_adapt is not None else 1
+
+    best_rep = None
+    best_bw = -1
+    best_seg_template = None
+    best_timescale = timescale_adapt
+
+    for rep in adapt.findall(f"{{{NS}}}Representation"):
+        bw = int(rep.get("bandwidth", "0"))
+        if bw > best_bw:
+            rep_seg = rep.find(f"{{{NS}}}SegmentTemplate")
+            best_rep = rep
+            best_bw = bw
+            best_seg_template = rep_seg if rep_seg is not None else seg_template_adapt
+            best_timescale = int(best_seg_template.get("timescale", str(timescale_adapt))) if best_seg_template is not None else timescale_adapt
+
+    return (best_rep, best_seg_template, best_timescale) if best_rep else None
+
+
+def mpd_to_m3u8(mpd_url):
+    req = urllib.request.Request(mpd_url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         mpd_content = resp.read()
 
     root = ET.fromstring(mpd_content)
     base_url = get_base_url(mpd_url)
 
-    best_v_rep = best_v_seg_tmpl = None
-    best_v_bw = 0
-    best_v_timescale = 1
+    # Determine if live stream
+    mpd_type = root.get("type", "static")
+    is_live = (mpd_type == "dynamic")
 
-    best_a_rep = best_a_seg_tmpl = None
-    best_a_bw = 0
-    best_a_timescale = 1
+    video_rep = audio_rep = None
+    video_seg_tmpl = audio_seg_tmpl = None
+    video_timescale = audio_timescale = 1
+    video_init = audio_init = None
 
     for period in root.findall(f"{{{NS}}}Period"):
         for adapt in period.findall(f"{{{NS}}}AdaptationSet"):
             mime = adapt.get("mimeType", "")
             content_type = adapt.get("contentType", "")
-            
+            lang = adapt.get("lang", "")
+
             is_video = "video" in mime or "video" in content_type
             is_audio = "audio" in mime or "audio" in content_type
-            
-            seg_template = adapt.find(f"{{{NS}}}SegmentTemplate")
-            
-            for rep in adapt.findall(f"{{{NS}}}Representation"):
-                bw = int(rep.get("bandwidth", "0"))
-                rep_seg = rep.find(f"{{{NS}}}SegmentTemplate")
-                actual_seg_tmpl = rep_seg if rep_seg is not None else seg_template
 
-                if actual_seg_tmpl is None:
-                    continue
+            result = pick_best_rep(adapt, base_url)
+            if result is None:
+                continue
+            rep, seg_tmpl, timescale = result
 
-                timescale = int(actual_seg_tmpl.get("timescale", "1"))
+            if is_video and video_rep is None:
+                video_rep = rep
+                video_seg_tmpl = seg_tmpl
+                video_timescale = timescale
+                init_pattern = seg_tmpl.get("initialization", "")
+                video_init = base_url + init_pattern.replace("$RepresentationID$", rep.get("id"))
 
-                if is_video and bw > best_v_bw:
-                    best_v_rep = rep
-                    best_v_bw = bw
-                    best_v_seg_tmpl = actual_seg_tmpl
-                    best_v_timescale = timescale
-                elif is_audio and bw > best_a_bw:
-                    best_a_rep = rep
-                    best_a_bw = bw
-                    best_a_seg_tmpl = actual_seg_tmpl
-                    best_a_timescale = timescale
+            elif is_audio and audio_rep is None:
+                audio_rep = rep
+                audio_seg_tmpl = seg_tmpl
+                audio_timescale = timescale
+                init_pattern = seg_tmpl.get("initialization", "")
+                audio_init = base_url + init_pattern.replace("$RepresentationID$", rep.get("id"))
 
-    if track == 'master':
-        if best_v_rep is None:
-            return None, "No video representation found"
+    if video_rep is None:
+        return None, "No video representation found"
 
-        v_codecs = best_v_rep.get("codecs", "avc1.64001f")
-        width = best_v_rep.get("width", "1280")
-        height = best_v_rep.get("height", "720")
+    # Parse video segments
+    video_segs = parse_segments(video_seg_tmpl, video_rep.get("id"), base_url, video_timescale)
+    if not video_segs:
+        return None, "No video segments found"
 
-        lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
+    # Parse audio segments (if separate AdaptationSet)
+    audio_segs = []
+    if audio_rep is not None and audio_seg_tmpl is not None:
+        audio_segs = parse_segments(audio_seg_tmpl, audio_rep.get("id"), base_url, audio_timescale)
 
-        if best_a_rep is not None:
-            a_codecs = best_a_rep.get("codecs", "mp4a.40.2")
-            audio_uri = f"{base_path}?track=audio"
-            lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="{audio_uri}"')
-            lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={best_v_bw},CODECS="{v_codecs},{a_codecs}",RESOLUTION={width}x{height},AUDIO="audio"')
-        else:
-            lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={best_v_bw},CODECS="{v_codecs}",RESOLUTION={width}x{height}')
-            
-        lines.append(f"{base_path}?track=video")
-        return "\n".join(lines), None
+    # Compute target duration (max segment duration, ceiling)
+    max_duration = max(d for _, d, _ in video_segs)
+    target_duration = math.ceil(max_duration)
 
-    is_video_track = (track == 'video')
-    target_rep = best_v_rep if is_video_track else best_a_rep
-    target_tmpl = best_v_seg_tmpl if is_video_track else best_a_seg_tmpl
-    target_timescale = best_v_timescale if is_video_track else best_a_timescale
+    # Media sequence: based on first segment timestamp / segment duration (for live positioning)
+    first_t = video_segs[0][2]
+    seg_dur_ticks = int(video_segs[0][1] * video_timescale)
+    media_sequence = first_t // seg_dur_ticks if seg_dur_ticks > 0 else 0
 
-    if target_rep is None:
-        return None, f"No {track} representation found in MPD"
+    # Build video codecs string
+    video_codecs = video_rep.get("codecs", "avc1.64001f")
+    width = video_rep.get("width", "1280")
+    height = video_rep.get("height", "720")
+    bandwidth = video_rep.get("bandwidth", "2500000")
 
-    rep_id = target_rep.get("id")
-    init_pattern = target_tmpl.get("initialization", "")
-    init_url = base_url + init_pattern.replace("$RepresentationID$", rep_id)
+    # Build audio codecs string
+    audio_codecs = ""
+    if audio_rep is not None:
+        audio_codecs = audio_rep.get("codecs", "mp4a.40.2")
 
-    segments = parse_segment_timeline(target_tmpl, rep_id, base_url, target_timescale)
+    # Combined codecs for STREAM-INF
+    combined_codecs = f"{video_codecs},{audio_codecs}" if audio_codecs else video_codecs
 
-    if not segments:
-        return None, "No segments found"
+    # -----------------------------------------------------------------
+    # If there is a separate audio track, build a multi-variant master
+    # playlist that references two separate media playlists — BUT since
+    # Vercel serverless can't serve multiple sub-routes from one handler,
+    # we embed both tracks inline using EXT-X-MEDIA + byte-range tricks.
+    #
+    # Simpler approach for compatibility: produce a single media playlist
+    # that interleaves #EXT-X-MAP for audio init then video init.
+    # Most players (hls.js, VLC, ExoPlayer) handle muxed-like playlists
+    # when audio segs map 1:1 with video segs.
+    # -----------------------------------------------------------------
 
-    LIVE_WINDOW = 5
-    if len(segments) > LIVE_WINDOW:
-        live_segments = segments[-LIVE_WINDOW:]
+    lines = []
+    lines.append("#EXTM3U")
+    lines.append("#EXT-X-VERSION:7")
+    lines.append(f"#EXT-X-TARGETDURATION:{target_duration}")
+    lines.append(f"#EXT-X-MEDIA-SEQUENCE:{media_sequence}")
+
+    if is_live:
+        # Live: tell player this is an event/live playlist, keep refreshing
+        lines.append("#EXT-X-PLAYLIST-TYPE:EVENT")
     else:
-        live_segments = segments
+        lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
 
-    media_seq = live_segments[0][2]
-    
-    # [FIX KEDUA] Kalkulasi Target Duration yang lebih pas
-    max_duration = max([s[1] for s in live_segments])
-    target_duration = int(max_duration + 1)
+    # Audio init map (must come before first audio segment reference)
+    if audio_init:
+        lines.append(f'#EXT-X-MAP:URI="{audio_init}"')
+        # Audio segments interleaved before video init
+        for seg_url, duration, _ in audio_segs:
+            lines.append(f"#EXTINF:{duration:.5f},")
+            lines.append(seg_url)
 
-    media_lines = [
-        "#EXTM3U",
-        "#EXT-X-VERSION:7",
-        f"#EXT-X-TARGETDURATION:{target_duration}",
-        f"#EXT-X-MEDIA-SEQUENCE:{media_seq}", 
-        f'#EXT-X-MAP:URI="{init_url}"'
+    # Video init map
+    lines.append(f'#EXT-X-MAP:URI="{video_init}"')
+
+    # Video segments
+    for seg_url, duration, _ in video_segs:
+        lines.append(f"#EXTINF:{duration:.5f},")
+        lines.append(seg_url)
+
+    if not is_live:
+        lines.append("#EXT-X-ENDLIST")
+
+    return "\n".join(lines), None
+
+
+# -----------------------------------------------------------------
+# ALTERNATIVE: proper muxed approach using separate audio/video tracks
+# Build a MASTER playlist + inline media playlists via path suffix
+# This is commented out above in favor of the simpler approach.
+# Uncomment this block and adjust routing in vercel.json if needed.
+# -----------------------------------------------------------------
+
+def mpd_to_master_m3u8(mpd_url, base_request_url, channel):
+    """
+    Returns a proper HLS master playlist that references:
+      - video media playlist: /channel.m3u8?type=video
+      - audio media playlist: /channel.m3u8?type=audio
+    Player fetches both and muxes them client-side (standard HLS).
+    """
+    req = urllib.request.Request(mpd_url, headers={"User-Agent": "Mozilla/5.0"})
+    with urllib.request.urlopen(req, timeout=10) as resp:
+        mpd_content = resp.read()
+
+    root = ET.fromstring(mpd_content)
+    base_url = get_base_url(mpd_url)
+
+    video_rep = audio_rep = None
+    video_seg_tmpl = audio_seg_tmpl = None
+    video_timescale = audio_timescale = 1
+    video_init = audio_init = None
+    audio_lang = "und"
+
+    for period in root.findall(f"{{{NS}}}Period"):
+        for adapt in period.findall(f"{{{NS}}}AdaptationSet"):
+            mime = adapt.get("mimeType", "")
+            content_type = adapt.get("contentType", "")
+            is_video = "video" in mime or "video" in content_type
+            is_audio = "audio" in mime or "audio" in content_type
+
+            result = pick_best_rep(adapt, base_url)
+            if result is None:
+                continue
+            rep, seg_tmpl, timescale = result
+
+            if is_video and video_rep is None:
+                video_rep, video_seg_tmpl, video_timescale = rep, seg_tmpl, timescale
+                init_pat = seg_tmpl.get("initialization", "")
+                video_init = base_url + init_pat.replace("$RepresentationID$", rep.get("id"))
+
+            elif is_audio and audio_rep is None:
+                audio_rep, audio_seg_tmpl, audio_timescale = rep, seg_tmpl, timescale
+                audio_lang = adapt.get("lang", "und")
+                init_pat = seg_tmpl.get("initialization", "")
+                audio_init = base_url + init_pat.replace("$RepresentationID$", rep.get("id"))
+
+    if video_rep is None:
+        return None, None, "No video representation found"
+
+    video_codecs = video_rep.get("codecs", "avc1.64001f")
+    audio_codecs = audio_rep.get("codecs", "mp4a.40.2") if audio_rep else "mp4a.40.2"
+    width = video_rep.get("width", "1280")
+    height = video_rep.get("height", "720")
+    bandwidth = video_rep.get("bandwidth", "2500000")
+
+    audio_url = f"/{channel}.m3u8?type=audio"
+    video_url = f"/{channel}.m3u8?type=video"
+
+    master_lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
+    if audio_rep is not None:
+        master_lines.append(
+            f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",LANGUAGE="{audio_lang}",'
+            f'NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="{audio_url}"'
+        )
+        master_lines.append(
+            f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{video_codecs},{audio_codecs}",'
+            f'RESOLUTION={width}x{height},AUDIO="audio"'
+        )
+    else:
+        master_lines.append(
+            f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{video_codecs}",'
+            f'RESOLUTION={width}x{height}'
+        )
+    master_lines.append(video_url)
+
+    # Build video media playlist
+    video_segs = parse_segments(video_seg_tmpl, video_rep.get("id"), base_url, video_timescale)
+    mpd_type = root.get("type", "static")
+    is_live = mpd_type == "dynamic"
+    max_dur = max(d for _, d, _ in video_segs) if video_segs else 4
+    target_dur = math.ceil(max_dur)
+    first_t = video_segs[0][2] if video_segs else 0
+    seg_ticks = int(video_segs[0][1] * video_timescale) if video_segs else 1
+    media_seq = first_t // seg_ticks if seg_ticks else 0
+
+    vlines = [
+        "#EXTM3U", "#EXT-X-VERSION:7",
+        f"#EXT-X-TARGETDURATION:{target_dur}",
+        f"#EXT-X-MEDIA-SEQUENCE:{media_seq}",
+        "#EXT-X-PLAYLIST-TYPE:EVENT" if is_live else "#EXT-X-PLAYLIST-TYPE:VOD",
+        f'#EXT-X-MAP:URI="{video_init}"',
     ]
+    for seg_url, duration, _ in video_segs:
+        vlines.append(f"#EXTINF:{duration:.5f},")
+        vlines.append(seg_url)
+    if not is_live:
+        vlines.append("#EXT-X-ENDLIST")
 
-    for seg_url, duration, _ in live_segments:
-        media_lines.append(f"#EXTINF:{duration:.5f},")
-        media_lines.append(seg_url)
+    # Build audio media playlist
+    alines = None
+    if audio_rep is not None:
+        audio_segs = parse_segments(audio_seg_tmpl, audio_rep.get("id"), base_url, audio_timescale)
+        a_max_dur = max(d for _, d, _ in audio_segs) if audio_segs else 4
+        a_target_dur = math.ceil(a_max_dur)
+        a_first_t = audio_segs[0][2] if audio_segs else 0
+        a_seg_ticks = int(audio_segs[0][1] * audio_timescale) if audio_segs else 1
+        a_media_seq = a_first_t // a_seg_ticks if a_seg_ticks else 0
+        alines = [
+            "#EXTM3U", "#EXT-X-VERSION:7",
+            f"#EXT-X-TARGETDURATION:{a_target_dur}",
+            f"#EXT-X-MEDIA-SEQUENCE:{a_media_seq}",
+            "#EXT-X-PLAYLIST-TYPE:EVENT" if is_live else "#EXT-X-PLAYLIST-TYPE:VOD",
+            f'#EXT-X-MAP:URI="{audio_init}"',
+        ]
+        for seg_url, duration, _ in audio_segs:
+            alines.append(f"#EXTINF:{duration:.5f},")
+            alines.append(seg_url)
+        if not is_live:
+            alines.append("#EXT-X-ENDLIST")
 
-    return "\n".join(media_lines), None
+    return "\n".join(master_lines), "\n".join(vlines), "\n".join(alines) if alines else None, None
 
 
 class handler(BaseHTTPRequestHandler):
@@ -279,10 +426,7 @@ class handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
 
-        track = 'master'
-        if "track" in qs:
-            track = qs["track"][0].lower()
-
+        # Resolve channel name
         if "channel" in qs:
             channel = qs["channel"][0].lower()
         else:
@@ -290,38 +434,43 @@ class handler(BaseHTTPRequestHandler):
             channel = re.sub(r"\.m3u8$", "", path).lower()
 
         if channel not in CHANNELS:
-            self.send_response(404)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(f"Channel '{channel}' not found.".encode())
+            self._send(404, "text/plain", f"Channel '{channel}' not found.")
             return
 
         mpd_url = CHANNELS[channel]
-        base_path = parsed.path 
+        track_type = qs.get("type", [None])[0]  # "video", "audio", or None (master)
 
         try:
-            m3u8_content, error = mpd_to_m3u8(mpd_url, track, base_path)
+            master, video_pl, audio_pl, error = mpd_to_master_m3u8(
+                mpd_url, self.path, channel
+            )
             if error:
-                self.send_response(500)
-                self.send_header("Content-Type", "text/plain")
-                self.end_headers()
-                self.wfile.write(f"Error: {error}".encode())
+                self._send(500, "text/plain", f"Error: {error}")
                 return
 
-            self.send_response(200)
-            self.send_header("Content-Type", "application/vnd.apple.mpegurl")
-            self.send_header("Access-Control-Allow-Origin", "*")
-            
-            # [FIX KEEMPAT] Menginstruksikan CDN Vercel agar 100% bypass cache
-            self.send_header("Cache-Control", "public, s-maxage=0, max-age=0, must-revalidate, proxy-revalidate, no-cache, no-store")
-            self.send_header("Pragma", "no-cache")
-            self.send_header("Expires", "0")
-            
-            self.end_headers()
-            self.wfile.write(m3u8_content.encode())
+            if track_type == "audio":
+                if audio_pl:
+                    self._send(200, "application/vnd.apple.mpegurl", audio_pl)
+                else:
+                    self._send(404, "text/plain", "No audio track available.")
+            elif track_type == "video":
+                self._send(200, "application/vnd.apple.mpegurl", video_pl)
+            else:
+                # Default: serve master playlist
+                self._send(200, "application/vnd.apple.mpegurl", master)
 
         except Exception as e:
-            self.send_response(500)
-            self.send_header("Content-Type", "text/plain")
-            self.end_headers()
-            self.wfile.write(f"Error: {str(e)}".encode())
+            self._send(500, "text/plain", f"Error: {str(e)}")
+
+    def _send(self, code, content_type, body):
+        encoded = body.encode("utf-8") if isinstance(body, str) else body
+        self.send_response(code)
+        self.send_header("Content-Type", content_type)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.send_header("Cache-Control", "no-cache, no-store")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+    def log_message(self, format, *args):
+        pass  # suppress default stderr logging on Vercel
