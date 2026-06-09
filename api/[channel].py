@@ -5,7 +5,6 @@ import urllib.request
 from urllib.parse import urlparse, parse_qs
 
 CHANNELS = {
-    "antv": "https://d84q7nw4qf3j3.cloudfront.net/out/v1/0a6c6b1534444ab4bd903af8761e6747/index.mpd",
     "btv": "https://cdnbal1.indihometv.com/atm/DASH/beritasatu/beritasatu-avc1_2500000=7-3277707030000000.mpd",
     "gtv": "https://cdnbal1.indihometv.com/atm/DASH/globaltv/globaltv-avc1_2500000=7-3277707030000000.mpd",
     "idx-channel": "https://cdnbal1.indihometv.com/atm/DASH/idx/idx-avc1_2500000=7-3277707030000000.mpd",
@@ -115,27 +114,42 @@ def parse_segment_timeline(seg_template, rep_id, base_url, timescale, pto):
     media_pattern = seg_template.get("media", "")
     seg_timeline = seg_template.find(f"{{{NS}}}SegmentTimeline")
     if seg_timeline is None:
-        return []
+        return [], 0
+
     segments = []
-    current_t = None
+    current_t = 0
+    first_t = 0
+    first_d = 1
+    is_first = True
+
     for s in seg_timeline.findall(f"{{{NS}}}S"):
         t = s.get("t")
         d = int(s.get("d"))
         r = int(s.get("r", "0"))
+        
         if t is not None:
             current_t = int(t)
+            
+        if is_first:
+            first_t = current_t
+            first_d = d
+            is_first = False
+
         for _ in range(r + 1):
             seg_name = media_pattern.replace("$RepresentationID$", rep_id).replace("$Time$", str(current_t))
             seg_url = base_url + seg_name
             duration = d / timescale
             segments.append((seg_url, duration))
             current_t += d
-    return segments
+
+    # Kalkulasi Media Sequence Dinamis untuk Fix Buffering
+    media_seq = first_t // first_d if first_d > 0 else 0
+    return segments, media_seq
 
 def get_base_url(mpd_url):
     return mpd_url.rsplit("/", 1)[0] + "/"
 
-def mpd_to_m3u8(mpd_url):
+def mpd_to_m3u8(mpd_url, track='master', base_path=''):
     req = urllib.request.Request(mpd_url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
         mpd_content = resp.read()
@@ -143,50 +157,97 @@ def mpd_to_m3u8(mpd_url):
     root = ET.fromstring(mpd_content)
     base_url = get_base_url(mpd_url)
 
-    best_rep = None
-    best_bw = 0
-    best_seg_template = None
-    best_timescale = 1
-    best_pto = 0
+    best_v_rep = best_v_seg_tmpl = None
+    best_v_bw = best_v_pto = 0
+    best_v_timescale = 1
+
+    best_a_rep = best_a_seg_tmpl = None
+    best_a_bw = best_a_pto = 0
+    best_a_timescale = 1
 
     for period in root.findall(f"{{{NS}}}Period"):
         for adapt in period.findall(f"{{{NS}}}AdaptationSet"):
             mime = adapt.get("mimeType", "")
             content_type = adapt.get("contentType", "")
-            if "video" not in mime and "video" not in content_type:
-                continue
+            
+            is_video = "video" in mime or "video" in content_type
+            is_audio = "audio" in mime or "audio" in content_type
+            
             seg_template = adapt.find(f"{{{NS}}}SegmentTemplate")
-            if seg_template is None:
-                continue
-            timescale = int(seg_template.get("timescale", "1"))
-            pto = int(seg_template.get("presentationTimeOffset", "0"))
+            
             for rep in adapt.findall(f"{{{NS}}}Representation"):
                 bw = int(rep.get("bandwidth", "0"))
-                if bw > best_bw:
-                    rep_seg = rep.find(f"{{{NS}}}SegmentTemplate")
-                    best_rep = rep
-                    best_bw = bw
-                    best_seg_template = rep_seg if rep_seg is not None else seg_template
-                    best_timescale = timescale
-                    best_pto = pto
+                rep_seg = rep.find(f"{{{NS}}}SegmentTemplate")
+                actual_seg_tmpl = rep_seg if rep_seg is not None else seg_template
 
-    if best_rep is None:
-        return None, "No video representation found"
+                if actual_seg_tmpl is None:
+                    continue
 
-    rep_id = best_rep.get("id")
-    init_pattern = best_seg_template.get("initialization", "")
+                timescale = int(actual_seg_tmpl.get("timescale", "1"))
+                pto = int(actual_seg_tmpl.get("presentationTimeOffset", "0"))
+
+                if is_video and bw > best_v_bw:
+                    best_v_rep = rep
+                    best_v_bw = bw
+                    best_v_seg_tmpl = actual_seg_tmpl
+                    best_v_timescale = timescale
+                    best_v_pto = pto
+                elif is_audio and bw > best_a_bw:
+                    best_a_rep = rep
+                    best_a_bw = bw
+                    best_a_seg_tmpl = actual_seg_tmpl
+                    best_a_timescale = timescale
+                    best_a_pto = pto
+
+    # 1. Bangun Master Playlist (Menghubungkan Video & Audio)
+    if track == 'master':
+        if best_v_rep is None:
+            return None, "No video representation found"
+
+        v_codecs = best_v_rep.get("codecs", "avc1.64001f")
+        width = best_v_rep.get("width", "1280")
+        height = best_v_rep.get("height", "720")
+
+        lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
+
+        if best_a_rep is not None:
+            a_codecs = best_a_rep.get("codecs", "mp4a.40.2")
+            audio_uri = f"{base_path}?track=audio"
+            lines.append(f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="{audio_uri}"')
+            lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={best_v_bw},CODECS="{v_codecs},{a_codecs}",RESOLUTION={width}x{height},AUDIO="audio"')
+        else:
+            lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={best_v_bw},CODECS="{v_codecs}",RESOLUTION={width}x{height}')
+            
+        lines.append(f"{base_path}?track=video")
+        return "\n".join(lines), None
+
+    # 2. Bangun Media Playlist Spesifik (Video atau Audio saja)
+    is_video_track = (track == 'video')
+    target_rep = best_v_rep if is_video_track else best_a_rep
+    target_tmpl = best_v_seg_tmpl if is_video_track else best_a_seg_tmpl
+    target_timescale = best_v_timescale if is_video_track else best_a_timescale
+    target_pto = best_v_pto if is_video_track else best_a_pto
+
+    if target_rep is None:
+        return None, f"No {track} representation found in MPD"
+
+    rep_id = target_rep.get("id")
+    init_pattern = target_tmpl.get("initialization", "")
     init_url = base_url + init_pattern.replace("$RepresentationID$", rep_id)
-    segments = parse_segment_timeline(best_seg_template, rep_id, base_url, best_timescale, best_pto)
+
+    segments, media_seq = parse_segment_timeline(target_tmpl, rep_id, base_url, target_timescale, target_pto)
 
     if not segments:
         return None, "No segments found"
 
-    media_lines = []
-    media_lines.append("#EXTM3U")
-    media_lines.append("#EXT-X-VERSION:7")
-    media_lines.append("#EXT-X-TARGETDURATION:4")
-    media_lines.append("#EXT-X-MEDIA-SEQUENCE:0")
-    media_lines.append(f'#EXT-X-MAP:URI="{init_url}"')
+    media_lines = [
+        "#EXTM3U",
+        "#EXT-X-VERSION:7",
+        "#EXT-X-TARGETDURATION:4",
+        f"#EXT-X-MEDIA-SEQUENCE:{media_seq}", # <--- Dinamis (Anti Buffering)
+        f'#EXT-X-MAP:URI="{init_url}"'
+    ]
+
     for seg_url, duration in segments:
         media_lines.append(f"#EXTINF:{duration:.5f},")
         media_lines.append(seg_url)
@@ -198,6 +259,12 @@ class handler(BaseHTTPRequestHandler):
     def do_GET(self):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
+
+        # Cek request track (master, video, atau audio)
+        track = 'master'
+        if "track" in qs:
+            track = qs["track"][0].lower()
+
         if "channel" in qs:
             channel = qs["channel"][0].lower()
         else:
@@ -212,20 +279,24 @@ class handler(BaseHTTPRequestHandler):
             return
 
         mpd_url = CHANNELS[channel]
+        base_path = parsed.path # Menjaga rute URL saat melempar playlist spesifik
+
         try:
-            m3u8_content, error = mpd_to_m3u8(mpd_url)
+            m3u8_content, error = mpd_to_m3u8(mpd_url, track, base_path)
             if error:
                 self.send_response(500)
                 self.send_header("Content-Type", "text/plain")
                 self.end_headers()
                 self.wfile.write(f"Error: {error}".encode())
                 return
+
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.apple.mpegurl")
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-cache")
+            self.send_header("Cache-Control", "no-cache") 
             self.end_headers()
             self.wfile.write(m3u8_content.encode())
+
         except Exception as e:
             self.send_response(500)
             self.send_header("Content-Type", "text/plain")
