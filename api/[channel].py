@@ -202,24 +202,24 @@ def parse_segments(seg_tmpl, rep_id, base_url, timescale):
     return segments
 
 
-def build_media_playlist(segs, init_url, is_live):
+def build_media_playlist(segs, init_url, is_live, timescale):
     if not segs:
         return None
     max_dur = max(d for _, d, _ in segs)
     target_dur = math.ceil(max_dur)
     first_t = segs[0][2]
-    seg_ticks = segs[0][1]
-    timescale_approx = int(first_t / seg_ticks) if seg_ticks > 0 else 1
-    media_seq = first_t // int(max_dur * timescale_approx + 0.5) if timescale_approx > 0 else 0
+    seg_d_ticks = int(segs[0][1] * timescale)
+    media_seq = (first_t // seg_d_ticks) if seg_d_ticks > 0 else 0
 
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:7",
         f"#EXT-X-TARGETDURATION:{target_dur}",
         f"#EXT-X-MEDIA-SEQUENCE:{media_seq}",
-        "#EXT-X-PLAYLIST-TYPE:EVENT" if is_live else "#EXT-X-PLAYLIST-TYPE:VOD",
-        f'#EXT-X-MAP:URI="{init_url}"',
     ]
+    if not is_live:
+        lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+    lines.append(f'#EXT-X-MAP:URI="{init_url}"')
     for seg_url, duration, _ in segs:
         lines.append(f"#EXTINF:{duration:.5f},")
         lines.append(seg_url)
@@ -316,7 +316,7 @@ class handler(BaseHTTPRequestHandler):
             bandwidth = v_rep.get("bandwidth", "2500000")
 
             if track_type == "video":
-                pl = build_media_playlist(v["segs"], v["init_url"], is_live)
+                pl = build_media_playlist(v["segs"], v["init_url"], is_live, v["timescale"])
                 if pl is None:
                     self._send(500, "text/plain", "Error: No video segments.")
                     return
@@ -326,7 +326,7 @@ class handler(BaseHTTPRequestHandler):
                 if a is None:
                     self._send(404, "text/plain", "No audio track available.")
                     return
-                pl = build_media_playlist(a["segs"], a["init_url"], is_live)
+                pl = build_media_playlist(a["segs"], a["init_url"], is_live, a["timescale"])
                 if pl is None:
                     self._send(500, "text/plain", "Error: No audio segments.")
                     return
