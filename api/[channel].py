@@ -110,6 +110,7 @@ CHANNELS = {
 }
 
 NS = "urn:mpeg:dash:schema:mpd:2011"
+WINDOW = 5
 CACHE_TTL = 2
 _cache = {}
 
@@ -131,7 +132,7 @@ def get_base_url(mpd_url):
     return mpd_url.rsplit("/", 1)[0] + "/"
 
 
-def parse_segment_timeline(seg_template, rep_id, base_url, timescale, pto):
+def parse_segment_timeline(seg_template, rep_id, base_url, timescale):
     media_pattern = seg_template.get("media", "")
     seg_timeline = seg_template.find(f"{{{NS}}}SegmentTimeline")
     if seg_timeline is None:
@@ -151,7 +152,7 @@ def parse_segment_timeline(seg_template, rep_id, base_url, timescale, pto):
                 .replace("$Time$", str(current_t))
             seg_url = base_url + seg_name
             duration = d / timescale
-            segments.append((seg_url, duration))
+            segments.append((seg_url, duration, current_t))
             current_t += d
     return segments
 
@@ -165,7 +166,6 @@ def mpd_to_m3u8(mpd_url):
     best_bw = 0
     best_seg_template = None
     best_timescale = 1
-    best_pto = 0
 
     for period in root.findall(f"{{{NS}}}Period"):
         for adapt in period.findall(f"{{{NS}}}AdaptationSet"):
@@ -177,7 +177,6 @@ def mpd_to_m3u8(mpd_url):
             if seg_template is None:
                 continue
             timescale = int(seg_template.get("timescale", "1"))
-            pto = int(seg_template.get("presentationTimeOffset", "0"))
             for rep in adapt.findall(f"{{{NS}}}Representation"):
                 bw = int(rep.get("bandwidth", "0"))
                 if bw > best_bw:
@@ -186,38 +185,45 @@ def mpd_to_m3u8(mpd_url):
                     best_bw = bw
                     best_seg_template = rep_seg if rep_seg is not None else seg_template
                     best_timescale = timescale
-                    best_pto = pto
 
     if best_rep is None:
         return None, "No video representation found"
 
     rep_id = best_rep.get("id")
-    codecs = best_rep.get("codecs", "avc1.64001f")
     bandwidth = best_rep.get("bandwidth", "1500000")
 
     init_pattern = best_seg_template.get("initialization", "")
     init_url = base_url + init_pattern.replace("$RepresentationID$", rep_id)
 
-    segments = parse_segment_timeline(best_seg_template, rep_id, base_url, best_timescale, best_pto)
-
-    if not segments:
+    all_segments = parse_segment_timeline(best_seg_template, rep_id, base_url, best_timescale)
+    if not all_segments:
         return None, "No segments found"
 
-    max_dur = max(d for _, d in segments)
+    # Ambil WINDOW segment terakhir (live edge)
+    window = all_segments[-WINDOW:]
+
+    # MEDIA-SEQUENCE = index absolut segment pertama di window
+    # Gunakan t/timescale sebagai sequence number agar naik tiap poll
+    first_t = window[0][2]
+    d_per_seg = window[0][1]  # durasi detik
+    # seq = posisi waktu / durasi per segment (integer increment per segment)
+    media_seq = int(first_t / best_timescale / d_per_seg)
+
+    max_dur = max(d for _, d, _ in window)
     target_dur = int(max_dur) + 1
 
-    media_lines = []
-    media_lines.append("#EXTM3U")
-    media_lines.append("#EXT-X-VERSION:7")
-    media_lines.append(f"#EXT-X-TARGETDURATION:{target_dur}")
-    media_lines.append("#EXT-X-MEDIA-SEQUENCE:0")
-    media_lines.append(f'#EXT-X-MAP:URI="{init_url}"')
+    lines = []
+    lines.append("#EXTM3U")
+    lines.append("#EXT-X-VERSION:7")
+    lines.append(f"#EXT-X-TARGETDURATION:{target_dur}")
+    lines.append(f"#EXT-X-MEDIA-SEQUENCE:{media_seq}")
+    lines.append(f'#EXT-X-MAP:URI="{init_url}"')
 
-    for seg_url, duration in segments:
-        media_lines.append(f"#EXTINF:{duration:.5f},")
-        media_lines.append(seg_url)
+    for seg_url, duration, _ in window:
+        lines.append(f"#EXTINF:{duration:.5f},")
+        lines.append(seg_url)
 
-    return "\n".join(media_lines), None
+    return "\n".join(lines), None
 
 
 class handler(BaseHTTPRequestHandler):
