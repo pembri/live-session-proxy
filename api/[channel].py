@@ -114,11 +114,10 @@ def parse_segment_timeline(seg_template, rep_id, base_url, timescale, pto):
     media_pattern = seg_template.get("media", "")
     seg_timeline = seg_template.find(f"{{{NS}}}SegmentTimeline")
     if seg_timeline is None:
-        return [], 0
+        return []
 
     segments = []
     current_t = 0
-    first_t = 0
     first_d = 1
     is_first = True
 
@@ -131,20 +130,21 @@ def parse_segment_timeline(seg_template, rep_id, base_url, timescale, pto):
             current_t = int(t)
             
         if is_first:
-            first_t = current_t
-            first_d = d
+            first_d = d if d > 0 else 1
             is_first = False
 
         for _ in range(r + 1):
             seg_name = media_pattern.replace("$RepresentationID$", rep_id).replace("$Time$", str(current_t))
             seg_url = base_url + seg_name
             duration = d / timescale
-            segments.append((seg_url, duration))
+            
+            # [FIX] Kalkulasi Media Sequence yang absolut berdasarkan waktu
+            seq_num = current_t // first_d 
+            
+            segments.append((seg_url, duration, seq_num))
             current_t += d
 
-    # Kalkulasi Media Sequence Dinamis untuk Fix Buffering
-    media_seq = first_t // first_d if first_d > 0 else 0
-    return segments, media_seq
+    return segments
 
 def get_base_url(mpd_url):
     return mpd_url.rsplit("/", 1)[0] + "/"
@@ -199,7 +199,6 @@ def mpd_to_m3u8(mpd_url, track='master', base_path=''):
                     best_a_timescale = timescale
                     best_a_pto = pto
 
-    # 1. Bangun Master Playlist (Menghubungkan Video & Audio)
     if track == 'master':
         if best_v_rep is None:
             return None, "No video representation found"
@@ -221,7 +220,6 @@ def mpd_to_m3u8(mpd_url, track='master', base_path=''):
         lines.append(f"{base_path}?track=video")
         return "\n".join(lines), None
 
-    # 2. Bangun Media Playlist Spesifik (Video atau Audio saja)
     is_video_track = (track == 'video')
     target_rep = best_v_rep if is_video_track else best_a_rep
     target_tmpl = best_v_seg_tmpl if is_video_track else best_a_seg_tmpl
@@ -235,20 +233,30 @@ def mpd_to_m3u8(mpd_url, track='master', base_path=''):
     init_pattern = target_tmpl.get("initialization", "")
     init_url = base_url + init_pattern.replace("$RepresentationID$", rep_id)
 
-    segments, media_seq = parse_segment_timeline(target_tmpl, rep_id, base_url, target_timescale, target_pto)
+    segments = parse_segment_timeline(target_tmpl, rep_id, base_url, target_timescale, target_pto)
 
     if not segments:
         return None, "No segments found"
+
+    # [FIX] Trik Anti-Looping: Ambil hanya 5 segmen terakhir (Live Edge)
+    LIVE_WINDOW = 5
+    if len(segments) > LIVE_WINDOW:
+        live_segments = segments[-LIVE_WINDOW:]
+    else:
+        live_segments = segments
+
+    # Ambil sequence number dari segmen pertama di live window
+    media_seq = live_segments[0][2]
 
     media_lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:7",
         "#EXT-X-TARGETDURATION:4",
-        f"#EXT-X-MEDIA-SEQUENCE:{media_seq}", # <--- Dinamis (Anti Buffering)
+        f"#EXT-X-MEDIA-SEQUENCE:{media_seq}", 
         f'#EXT-X-MAP:URI="{init_url}"'
     ]
 
-    for seg_url, duration in segments:
+    for seg_url, duration, _ in live_segments:
         media_lines.append(f"#EXTINF:{duration:.5f},")
         media_lines.append(seg_url)
 
@@ -260,7 +268,6 @@ class handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
 
-        # Cek request track (master, video, atau audio)
         track = 'master'
         if "track" in qs:
             track = qs["track"][0].lower()
@@ -279,7 +286,7 @@ class handler(BaseHTTPRequestHandler):
             return
 
         mpd_url = CHANNELS[channel]
-        base_path = parsed.path # Menjaga rute URL saat melempar playlist spesifik
+        base_path = parsed.path 
 
         try:
             m3u8_content, error = mpd_to_m3u8(mpd_url, track, base_path)
@@ -293,7 +300,12 @@ class handler(BaseHTTPRequestHandler):
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.apple.mpegurl")
             self.send_header("Access-Control-Allow-Origin", "*")
-            self.send_header("Cache-Control", "no-cache") 
+            
+            # [FIX] Matikan cache Vercel secara paksa dan agresif
+            self.send_header("Cache-Control", "no-store, no-cache, must-revalidate, proxy-revalidate, max-age=0")
+            self.send_header("Pragma", "no-cache")
+            self.send_header("Expires", "0")
+            
             self.end_headers()
             self.wfile.write(m3u8_content.encode())
 
