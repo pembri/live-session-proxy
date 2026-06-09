@@ -202,9 +202,15 @@ def parse_segments(seg_tmpl, rep_id, base_url, timescale):
     return segments
 
 
-def build_media_playlist(segs, init_url, is_live, timescale, audio_track=None):
+def build_media_playlist(segs, init_url, is_live, timescale):
     if not segs:
         return None
+
+    # For live: only keep last 5 segments to stay at live edge
+    # reduces buffering by not loading stale segments
+    if is_live and len(segs) > 5:
+        segs = segs[-5:]
+
     max_dur = max(d for _, d, _ in segs)
     target_dur = math.ceil(max_dur)
     first_t = segs[0][2]
@@ -219,14 +225,6 @@ def build_media_playlist(segs, init_url, is_live, timescale, audio_track=None):
     ]
     if not is_live:
         lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
-
-    # If separate audio track exists, prepend audio init + segments
-    # then switch map to video init. Most HLS players handle this correctly.
-    if audio_track and audio_track.get("segs"):
-        lines.append(f'#EXT-X-MAP:URI="{audio_track["init_url"]}"')
-        for seg_url, duration, _ in audio_track["segs"]:
-            lines.append(f"#EXTINF:{duration:.5f},")
-            lines.append(seg_url)
 
     lines.append(f'#EXT-X-MAP:URI="{init_url}"')
     for seg_url, duration, _ in segs:
@@ -317,15 +315,52 @@ class handler(BaseHTTPRequestHandler):
                 return
 
             v = video_track
+            a = audio_track
 
-            # Serve single media playlist directly - works on all players
-            # including native browser video player and hls.js-based players.
-            # MPD segments from indihometv are already muxed (video+audio in one .m4s).
-            pl = build_media_playlist(v["segs"], v["init_url"], is_live, v["timescale"], audio_track=audio_track)
-            if pl is None:
-                self._send(500, "text/plain", "Error: No video segments.")
-                return
-            self._send(200, "application/vnd.apple.mpegurl", pl)
+            if track_type == "video":
+                pl = build_media_playlist(v["segs"], v["init_url"], is_live, v["timescale"])
+                if pl is None:
+                    self._send(500, "text/plain", "Error: No video segments.")
+                    return
+                self._send(200, "application/vnd.apple.mpegurl", pl)
+
+            elif track_type == "audio":
+                if a is None:
+                    self._send(404, "text/plain", "No audio track.")
+                    return
+                pl = build_media_playlist(a["segs"], a["init_url"], is_live, a["timescale"])
+                if pl is None:
+                    self._send(500, "text/plain", "Error: No audio segments.")
+                    return
+                self._send(200, "application/vnd.apple.mpegurl", pl)
+
+            else:
+                # Default: HLS master playlist with separate audio+video tracks
+                # Chrome Android 107+ supports EXT-X-MEDIA audio tracks natively
+                v_rep = v["rep"]
+                v_codecs = v_rep.get("codecs", "avc1.64001f")
+                width = v_rep.get("width", v["adapt"].get("width", "1280"))
+                height = v_rep.get("height", v["adapt"].get("height", "720"))
+                bandwidth = v_rep.get("bandwidth", "2500000")
+                a_codecs = a["rep"].get("codecs", "mp4a.40.2") if a else "mp4a.40.2"
+
+                lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
+                if a:
+                    lang = a.get("lang", "und")
+                    lines.append(
+                        f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",LANGUAGE="{lang}",'
+                        f'NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="/{channel}.m3u8?type=audio"'
+                    )
+                    lines.append(
+                        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs},{a_codecs}",'
+                        f'RESOLUTION={width}x{height},AUDIO="audio"'
+                    )
+                else:
+                    lines.append(
+                        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs}",RESOLUTION={width}x{height}'
+                    )
+                lines.append(f"/{channel}.m3u8?type=video")
+                self._send(200, "application/vnd.apple.mpegurl", "\n".join(lines))
 
         except Exception as e:
             self._send(500, "text/plain", f"Error: {str(e)}")
