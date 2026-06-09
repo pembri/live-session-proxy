@@ -2,6 +2,7 @@ import re
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler
 import urllib.request
+from urllib.parse import urlparse, parse_qs
 
 CHANNELS = {
     "btv": "https://cdnbal1.indihometv.com/atm/DASH/beritasatu/beritasatu-avc1_2500000=7-3277707030000000.mpd",
@@ -114,7 +115,6 @@ def parse_segment_timeline(seg_template, rep_id, base_url, timescale, pto):
     seg_timeline = seg_template.find(f"{{{NS}}}SegmentTimeline")
     if seg_timeline is None:
         return []
-
     segments = []
     current_t = None
     for s in seg_timeline.findall(f"{{{NS}}}S"):
@@ -142,7 +142,6 @@ def mpd_to_m3u8(mpd_url):
     root = ET.fromstring(mpd_content)
     base_url = get_base_url(mpd_url)
 
-    # Pick video AdaptationSet with highest bandwidth Representation
     best_rep = None
     best_bw = 0
     best_seg_template = None
@@ -163,7 +162,6 @@ def mpd_to_m3u8(mpd_url):
             for rep in adapt.findall(f"{{{NS}}}Representation"):
                 bw = int(rep.get("bandwidth", "0"))
                 if bw > best_bw:
-                    # Check if rep has its own SegmentTemplate
                     rep_seg = rep.find(f"{{{NS}}}SegmentTemplate")
                     best_rep = rep
                     best_bw = bw
@@ -175,36 +173,19 @@ def mpd_to_m3u8(mpd_url):
         return None, "No video representation found"
 
     rep_id = best_rep.get("id")
-    codecs = best_rep.get("codecs", "avc1.64001f")
-    width = best_rep.get("width", "1280")
-    height = best_rep.get("height", "720")
-    bandwidth = best_rep.get("bandwidth", "1500000")
-
-    # Init segment
     init_pattern = best_seg_template.get("initialization", "")
     init_url = base_url + init_pattern.replace("$RepresentationID$", rep_id)
-
-    # Segments
     segments = parse_segment_timeline(best_seg_template, rep_id, base_url, best_timescale, best_pto)
 
     if not segments:
         return None, "No segments found"
 
-    # Build M3U8
-    lines = []
-    lines.append("#EXTM3U")
-    lines.append("#EXT-X-VERSION:7")
-    lines.append(f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{codecs}",RESOLUTION={width}x{height}')
-    lines.append("")  # placeholder — will be replaced by actual segment list
-
-    # Actually build as media playlist directly (not master)
     media_lines = []
     media_lines.append("#EXTM3U")
     media_lines.append("#EXT-X-VERSION:7")
     media_lines.append("#EXT-X-TARGETDURATION:4")
     media_lines.append("#EXT-X-MEDIA-SEQUENCE:0")
     media_lines.append(f'#EXT-X-MAP:URI="{init_url}"')
-
     for seg_url, duration in segments:
         media_lines.append(f"#EXTINF:{duration:.5f},")
         media_lines.append(seg_url)
@@ -214,11 +195,8 @@ def mpd_to_m3u8(mpd_url):
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        # Extract channel from path or query param
-        from urllib.parse import urlparse, parse_qs
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
-
         if "channel" in qs:
             channel = qs["channel"][0].lower()
         else:
@@ -233,7 +211,6 @@ class handler(BaseHTTPRequestHandler):
             return
 
         mpd_url = CHANNELS[channel]
-
         try:
             m3u8_content, error = mpd_to_m3u8(mpd_url)
             if error:
@@ -242,14 +219,12 @@ class handler(BaseHTTPRequestHandler):
                 self.end_headers()
                 self.wfile.write(f"Error: {error}".encode())
                 return
-
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.apple.mpegurl")
             self.send_header("Access-Control-Allow-Origin", "*")
             self.send_header("Cache-Control", "no-cache")
             self.end_headers()
             self.wfile.write(m3u8_content.encode())
-
         except Exception as e:
             self.send_response(500)
             self.send_header("Content-Type", "text/plain")
