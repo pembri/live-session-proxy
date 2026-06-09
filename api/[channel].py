@@ -110,6 +110,11 @@ CHANNELS = {
 }
 
 NS = "urn:mpeg:dash:schema:mpd:2011"
+
+# ── Tuning constants ─────────────────────────────────────────────────────────
+# How many segments to keep in the live window.
+# More = bigger buffer = more stable but more delay.
+# 10 segments ≈ ~30–50 s delay (typical 3–5 s/seg), enough to hide network jitter.
 LIVE_WINDOW = 10
 
 
@@ -121,29 +126,36 @@ def detect_track_type(adapt, rep):
     mime = adapt.get("mimeType", "")
     content_type = adapt.get("contentType", "")
     codecs = rep.get("codecs", adapt.get("codecs", ""))
+
     if "video" in mime or "video" in content_type:
         return "video"
     if "audio" in mime or "audio" in content_type:
         return "audio"
+
     video_prefixes = ("avc", "hvc", "hev", "vp8", "vp9", "av01")
     audio_prefixes = ("mp4a", "ac-3", "ec-3", "opus", "vorbis")
+
     codecs_lower = codecs.lower()
     if any(codecs_lower.startswith(p) for p in video_prefixes):
         return "video"
     if any(codecs_lower.startswith(p) for p in audio_prefixes):
         return "audio"
+
     if rep.get("width") or rep.get("height") or adapt.get("width") or adapt.get("height"):
         return "video"
+
     return None
 
 
 def pick_best_rep(adapt):
     seg_tmpl_adapt = adapt.find(f"{{{NS}}}SegmentTemplate")
     ts_adapt = int(seg_tmpl_adapt.get("timescale", "1")) if seg_tmpl_adapt is not None else 1
+
     best_rep = None
     best_bw = -1
     best_seg_tmpl = None
     best_ts = ts_adapt
+
     for rep in adapt.findall(f"{{{NS}}}Representation"):
         bw = int(rep.get("bandwidth", "0"))
         if bw > best_bw:
@@ -153,16 +165,19 @@ def pick_best_rep(adapt):
             best_bw = bw
             best_seg_tmpl = chosen
             best_ts = int(chosen.get("timescale", str(ts_adapt))) if chosen is not None else ts_adapt
+
     if best_rep is None or best_seg_tmpl is None:
         return None
     return best_rep, best_seg_tmpl, best_ts
 
 
 def parse_segments(seg_tmpl, rep_id, base_url, timescale):
+    """Returns list of (url, duration_seconds, timestamp)."""
     media_pattern = seg_tmpl.get("media", "")
     seg_timeline = seg_tmpl.find(f"{{{NS}}}SegmentTimeline")
     if seg_timeline is None:
         return []
+
     segments = []
     current_t = None
     for s in seg_timeline.findall(f"{{{NS}}}S"):
@@ -185,25 +200,46 @@ def parse_segments(seg_tmpl, rep_id, base_url, timescale):
 def build_media_playlist(segs, init_url, is_live, timescale):
     if not segs:
         return None
+
+    # ── Live window: keep last LIVE_WINDOW segments ──────────────────────────
+    # Larger window = more pre-buffered content = smoother playback.
+    # Player will reload this playlist every ~target_duration seconds,
+    # so as long as LIVE_WINDOW > (round-trip latency / seg_duration) the
+    # player always has something to play next.
     if is_live and len(segs) > LIVE_WINDOW:
         segs = segs[-LIVE_WINDOW:]
+
     max_dur = max(d for _, d, _ in segs)
     target_dur = math.ceil(max_dur)
+
+    # ── Media sequence: derived from first segment timestamp ─────────────────
+    # Must be monotonically increasing across playlist refreshes so the
+    # player knows which segments are new vs already downloaded.
     first_t = segs[0][2]
     seg_d_ticks = int(segs[0][1] * timescale)
     media_seq = (first_t // seg_d_ticks) if seg_d_ticks > 0 else 0
+
     lines = [
         "#EXTM3U",
         "#EXT-X-VERSION:7",
         f"#EXT-X-TARGETDURATION:{target_dur}",
         f"#EXT-X-MEDIA-SEQUENCE:{media_seq}",
+        # EXT-X-DISCONTINUITY-SEQUENCE tells the player to expect gaps
+        # in the timestamp sequence (common when MPD is refreshed and the
+        # live window slides forward). Without this some players stall.
         "#EXT-X-DISCONTINUITY-SEQUENCE:0",
     ]
+
     if not is_live:
         lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+
     lines.append(f'#EXT-X-MAP:URI="{init_url}"')
+
     prev_t = None
     for seg_url, duration, t in segs:
+        # Insert discontinuity marker when there is a timestamp gap larger
+        # than 1.5× the expected segment duration.  This prevents the
+        # player from trying to extrapolate a missing piece and stalling.
         if prev_t is not None and seg_d_ticks > 0:
             expected_t = prev_t + seg_d_ticks
             if abs(t - expected_t) > seg_d_ticks * 1.5:
@@ -211,6 +247,7 @@ def build_media_playlist(segs, init_url, is_live, timescale):
         lines.append(f"#EXTINF:{duration:.5f},")
         lines.append(seg_url)
         prev_t = t
+
     if not is_live:
         lines.append("#EXT-X-ENDLIST")
     return "\n".join(lines)
@@ -229,6 +266,7 @@ def parse_mpd(mpd_url):
 def get_tracks(root, base_url):
     video_track = None
     audio_track = None
+
     for period in root.findall(f"{{{NS}}}Period"):
         for adapt in period.findall(f"{{{NS}}}AdaptationSet"):
             result = pick_best_rep(adapt)
@@ -236,12 +274,14 @@ def get_tracks(root, base_url):
                 continue
             rep, seg_tmpl, timescale = result
             track_type = detect_track_type(adapt, rep)
+
             if track_type == "video" and video_track is None:
                 init_pat = seg_tmpl.get("initialization", "")
                 init_url = base_url + init_pat.replace("$RepresentationID$", rep.get("id", ""))
                 segs = parse_segments(seg_tmpl, rep.get("id", ""), base_url, timescale)
                 video_track = {"rep": rep, "seg_tmpl": seg_tmpl, "timescale": timescale,
                                "init_url": init_url, "segs": segs, "adapt": adapt}
+
             elif track_type == "audio" and audio_track is None:
                 init_pat = seg_tmpl.get("initialization", "")
                 init_url = base_url + init_pat.replace("$RepresentationID$", rep.get("id", ""))
@@ -249,8 +289,10 @@ def get_tracks(root, base_url):
                 audio_track = {"rep": rep, "seg_tmpl": seg_tmpl, "timescale": timescale,
                                "init_url": init_url, "segs": segs, "adapt": adapt,
                                "lang": adapt.get("lang", "und")}
+
         if video_track is not None:
             break
+
     return video_track, audio_track
 
 
@@ -274,7 +316,8 @@ class handler(BaseHTTPRequestHandler):
         track_type = qs.get("type", [None])[0]
 
         host = self.headers.get("Host", "")
-        scheme = self.headers.get("X-Forwarded-Proto", "https") or "https"
+        x_forwarded_proto = self.headers.get("X-Forwarded-Proto", "https")
+        scheme = x_forwarded_proto if x_forwarded_proto else "https"
         proxy_base = f"{scheme}://{host}"
 
         try:
@@ -306,19 +349,6 @@ class handler(BaseHTTPRequestHandler):
                 self._send(200, "application/vnd.apple.mpegurl", pl)
 
             else:
-                # ── KEY FIX ───────────────────────────────────────────────────
-                # Chrome Android native <video> player does NOT support
-                # EXT-X-MEDIA audio rendition groups — it silently fails and
-                # shows black screen.
-                #
-                # Strategy: serve a master playlist that lists BOTH a muxed
-                # (video-only) variant AND uses EXT-X-MEDIA for capable players.
-                # But the default/first variant URI points to the video playlist
-                # directly — so Chrome picks it up immediately.
-                #
-                # For players that DO support audio groups (VLC, Safari, hls.js),
-                # they'll pick the audio group variant instead.
-                # ─────────────────────────────────────────────────────────────
                 v_rep = v["rep"]
                 v_codecs = v_rep.get("codecs", "avc1.64001f")
                 width = v_rep.get("width", v["adapt"].get("width", "1280"))
@@ -330,34 +360,21 @@ class handler(BaseHTTPRequestHandler):
                 audio_uri = f"{proxy_base}/{channel}.m3u8?type=audio"
 
                 lines = ["#EXTM3U", "#EXT-X-VERSION:7"]
-
                 if a:
                     lang = a.get("lang", "und")
-                    # Audio rendition — capable players (hls.js, Safari, VLC) use this
                     lines.append(
                         f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",LANGUAGE="{lang}",'
                         f'NAME="Audio",DEFAULT=YES,AUTOSELECT=YES,URI="{audio_uri}"'
                     )
-                    # Variant 1: with audio group (for capable players)
                     lines.append(
                         f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs},{a_codecs}",'
                         f'RESOLUTION={width}x{height},AUDIO="audio"'
                     )
-                    lines.append(video_uri)
-                    # Variant 2: video-only fallback (no AUDIO= attribute)
-                    # Chrome Android picks this when it can't handle audio groups
-                    lines.append(
-                        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs}",'
-                        f'RESOLUTION={width}x{height}'
-                    )
-                    lines.append(video_uri)
                 else:
                     lines.append(
-                        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs}",'
-                        f'RESOLUTION={width}x{height}'
+                        f'#EXT-X-STREAM-INF:BANDWIDTH={bandwidth},CODECS="{v_codecs}",RESOLUTION={width}x{height}'
                     )
-                    lines.append(video_uri)
-
+                lines.append(video_uri)
                 self._send(200, "application/vnd.apple.mpegurl", "\n".join(lines))
 
         except Exception as e:
