@@ -202,7 +202,7 @@ def parse_segments(seg_tmpl, rep_id, base_url, timescale):
     return segments
 
 
-def build_media_playlist(segs, init_url, is_live, timescale):
+def build_media_playlist(segs, init_url, is_live, timescale, audio_track=None):
     if not segs:
         return None
     max_dur = max(d for _, d, _ in segs)
@@ -219,6 +219,15 @@ def build_media_playlist(segs, init_url, is_live, timescale):
     ]
     if not is_live:
         lines.append("#EXT-X-PLAYLIST-TYPE:VOD")
+
+    # If separate audio track exists, prepend audio init + segments
+    # then switch map to video init. Most HLS players handle this correctly.
+    if audio_track and audio_track.get("segs"):
+        lines.append(f'#EXT-X-MAP:URI="{audio_track["init_url"]}"')
+        for seg_url, duration, _ in audio_track["segs"]:
+            lines.append(f"#EXTINF:{duration:.5f},")
+            lines.append(seg_url)
+
     lines.append(f'#EXT-X-MAP:URI="{init_url}"')
     for seg_url, duration, _ in segs:
         lines.append(f"#EXTINF:{duration:.5f},")
@@ -312,7 +321,7 @@ class handler(BaseHTTPRequestHandler):
             # Serve single media playlist directly - works on all players
             # including native browser video player and hls.js-based players.
             # MPD segments from indihometv are already muxed (video+audio in one .m4s).
-            pl = build_media_playlist(v["segs"], v["init_url"], is_live, v["timescale"])
+            pl = build_media_playlist(v["segs"], v["init_url"], is_live, v["timescale"], audio_track=audio_track)
             if pl is None:
                 self._send(500, "text/plain", "Error: No video segments.")
                 return
