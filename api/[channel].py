@@ -151,9 +151,9 @@ def build_media_playlist(init_url, segs, window=6):
     if not segs:
         return None
     win = segs[-window:]
-    first_t = win[0][2]
-    avg_d_ticks = sum(s[1] for s in win) / len(win) * 10000000
-    seq = int(first_t / avg_d_ticks) if avg_d_ticks > 0 else 0
+    # sequence = index of first segment in window from total list
+    total = len(segs)
+    seq = total - len(win)
     target = int(max(s[1] for s in win)) + 1
 
     lines = [
