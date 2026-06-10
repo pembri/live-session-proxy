@@ -285,9 +285,12 @@ class handler(BaseHTTPRequestHandler):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         path = parsed.path.lstrip("/")
+        if path.startswith("api/"):
+            path = path[4:]
 
         # ── Segment proxy ──────────────────────────────────────────
-        if path == "seg":
+        is_seg = path == "seg" or qs.get("channel", [None])[0] == "seg"
+        if is_seg:
             u = qs.get("u", [None])[0]
             if not u:
                 self.send_response(400)
