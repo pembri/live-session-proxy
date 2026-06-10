@@ -112,7 +112,7 @@ CHANNELS = {
 NS = "urn:mpeg:dash:schema:mpd:2011"
 CACHE_TTL = 2
 _cache = {}
-PROXY_BASE = "https://cdn-live-proxy.vidiraplay.biz.id/seg"
+PROXY_BASE = "https://cdn-live-proxy.vidiraplay.biz.id/api/seg"
 
 
 def proxy_url(url):
