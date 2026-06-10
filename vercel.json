@@ -1,5 +1,6 @@
 {
   "version": 2,
+  "regions": ["sin1"],
   "builds": [
     {
       "src": "api/proxy.py",
@@ -8,7 +9,7 @@
   ],
   "routes": [
     {
-      "src": "/(indihome|visionplus|vidio)/(.+)\\.mpd",
+      "src": "/(indihome|visionplus|vidio)/.+",
       "dest": "/api/proxy.py"
     }
   ]
