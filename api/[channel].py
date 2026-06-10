@@ -2,7 +2,7 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs
+from urllib.parse import urlparse, parse_qs, urlencode, quote
 import urllib.request
 
 CHANNELS = {
@@ -112,12 +112,17 @@ CHANNELS = {
 NS = "urn:mpeg:dash:schema:mpd:2011"
 CACHE_TTL = 2
 _cache = {}
+PROXY_BASE = "https://cdn-live-proxy.vidiraplay.biz.id/seg"
 
 
-def fetch_mpd(mpd_url):
-    req = urllib.request.Request(mpd_url, headers={"User-Agent": "Mozilla/5.0"})
+def proxy_url(url):
+    return f"{PROXY_BASE}?u={quote(url, safe='')}"
+
+
+def fetch_url(url):
+    req = urllib.request.Request(url, headers={"User-Agent": "Mozilla/5.0"})
     with urllib.request.urlopen(req, timeout=10) as resp:
-        return resp.read()
+        return resp.read(), dict(resp.headers)
 
 
 def get_base_url(mpd_url):
@@ -125,12 +130,10 @@ def get_base_url(mpd_url):
 
 
 def parse_segments(seg_tmpl, rep_id, base_url, timescale):
-    """Parse SegmentTimeline into list of (url, duration_seconds, time_value)"""
     media = seg_tmpl.get("media", "")
     timeline = seg_tmpl.find(f"{{{NS}}}SegmentTimeline")
     if timeline is None:
         return []
-
     segs = []
     current_t = None
     for s in timeline.findall(f"{{{NS}}}S"):
@@ -148,18 +151,12 @@ def parse_segments(seg_tmpl, rep_id, base_url, timescale):
 
 
 def build_media_playlist(init_url, segs, window=6):
-    """Build HLS media playlist from segment list, live sliding window"""
     if not segs:
         return None
-
     win = segs[-window:]
-    # EXT-X-MEDIA-SEQUENCE derived from timestamp of first segment in window
-    # divided by timescale*segment_duration to get a monotonic sequence number
     first_t = win[0][2]
-    avg_d = sum(s[1] for s in win) / len(win)
-    # approximate sequence: total segments elapsed
-    seq = int(first_t / (avg_d * 10000000))
-
+    avg_d_ticks = sum(s[1] for s in win) / len(win) * 10000000
+    seq = int(first_t / avg_d_ticks) if avg_d_ticks > 0 else 0
     target = int(max(s[1] for s in win)) + 1
 
     lines = [
@@ -168,27 +165,24 @@ def build_media_playlist(init_url, segs, window=6):
         f"#EXT-X-TARGETDURATION:{target}",
         f"#EXT-X-MEDIA-SEQUENCE:{seq}",
         "#EXT-X-INDEPENDENT-SEGMENTS",
-        f'#EXT-X-MAP:URI="{init_url}"',
+        f'#EXT-X-MAP:URI="{proxy_url(init_url)}"',
     ]
     for url, dur, _ in win:
         lines.append(f"#EXTINF:{dur:.5f},")
-        lines.append(url)
-
+        lines.append(proxy_url(url))
     return "\n".join(lines)
 
 
 def parse_mpd(mpd_url):
-    raw = fetch_mpd(mpd_url)
+    raw, _ = fetch_url(mpd_url)
     root = ET.fromstring(raw)
     base_url = get_base_url(mpd_url)
 
-    audio_rep = None
-    audio_tmpl = None
-    audio_timescale = 1
-    video_rep = None
-    video_tmpl = None
-    video_timescale = 1
-    best_video_bw = 0
+    audio_rep = audio_tmpl = None
+    audio_ts = 1
+    video_rep = video_tmpl = None
+    video_ts = 1
+    best_bw = 0
 
     for period in root.findall(f"{{{NS}}}Period"):
         for adapt in period.findall(f"{{{NS}}}AdaptationSet"):
@@ -200,32 +194,28 @@ def parse_mpd(mpd_url):
             ts = int(adapt_tmpl.get("timescale", "1"))
 
             if "audio" in mime or "audio" in ctype:
-                # Take first audio representation
                 if audio_rep is None:
                     for rep in adapt.findall(f"{{{NS}}}Representation"):
                         rep_tmpl = rep.find(f"{{{NS}}}SegmentTemplate")
                         audio_rep = rep
                         audio_tmpl = rep_tmpl if rep_tmpl is not None else adapt_tmpl
-                        audio_timescale = ts
+                        audio_ts = ts
                         break
-
             elif "video" in mime or "video" in ctype:
-                # Take highest bandwidth video representation
                 for rep in adapt.findall(f"{{{NS}}}Representation"):
                     bw = int(rep.get("bandwidth", "0"))
-                    if bw > best_video_bw:
+                    if bw > best_bw:
                         rep_tmpl = rep.find(f"{{{NS}}}SegmentTemplate")
                         video_rep = rep
                         video_tmpl = rep_tmpl if rep_tmpl is not None else adapt_tmpl
-                        video_timescale = ts
-                        best_video_bw = bw
+                        video_ts = ts
+                        best_bw = bw
 
-    return base_url, audio_rep, audio_tmpl, audio_timescale, video_rep, video_tmpl, video_timescale
+    return base_url, audio_rep, audio_tmpl, audio_ts, video_rep, video_tmpl, video_ts
 
 
 def build_playlists(mpd_url, channel):
     base_url, audio_rep, audio_tmpl, audio_ts, video_rep, video_tmpl, video_ts = parse_mpd(mpd_url)
-
     if video_rep is None:
         return None, None, None, "No video found"
 
@@ -234,7 +224,6 @@ def build_playlists(mpd_url, channel):
     vid_bw = video_rep.get("bandwidth", "1500000")
     vid_w = video_rep.get("width", "1280")
     vid_h = video_rep.get("height", "720")
-
     vid_init = base_url + video_tmpl.get("initialization", "").replace("$RepresentationID$", vid_id)
     vid_segs = parse_segments(video_tmpl, vid_id, base_url, video_ts)
     video_playlist = build_media_playlist(vid_init, vid_segs)
@@ -248,22 +237,18 @@ def build_playlists(mpd_url, channel):
         aud_segs = parse_segments(audio_tmpl, aud_id, base_url, audio_ts)
         audio_playlist = build_media_playlist(aud_init, aud_segs)
 
-    # Build master playlist
     master_lines = ["#EXTM3U", "#EXT-X-VERSION:7", "#EXT-X-INDEPENDENT-SEGMENTS"]
-
     if audio_playlist:
         master_lines.append(
             f'#EXT-X-MEDIA:TYPE=AUDIO,GROUP-ID="audio",NAME="Audio",DEFAULT=YES,URI="{channel}-audio.m3u8"'
         )
-        combined_codecs = f"{vid_codecs},{aud_codecs}"
         master_lines.append(
-            f'#EXT-X-STREAM-INF:BANDWIDTH={vid_bw},CODECS="{combined_codecs}",RESOLUTION={vid_w}x{vid_h},AUDIO="audio"'
+            f'#EXT-X-STREAM-INF:BANDWIDTH={vid_bw},CODECS="{vid_codecs},{aud_codecs}",RESOLUTION={vid_w}x{vid_h},AUDIO="audio"'
         )
     else:
         master_lines.append(
             f'#EXT-X-STREAM-INF:BANDWIDTH={vid_bw},CODECS="{vid_codecs}",RESOLUTION={vid_w}x{vid_h}'
         )
-
     master_lines.append(f"{channel}-video.m3u8")
     master_playlist = "\n".join(master_lines)
 
@@ -284,14 +269,48 @@ def get_cached(channel, mpd_url):
     return data, None
 
 
+def send_cors(h):
+    h.send_header("Access-Control-Allow-Origin", "*")
+    h.send_header("Access-Control-Allow-Methods", "GET, OPTIONS")
+    h.send_header("Access-Control-Allow-Headers", "*")
+
+
 class handler(BaseHTTPRequestHandler):
+    def do_OPTIONS(self):
+        self.send_response(204)
+        send_cors(self)
+        self.end_headers()
+
     def do_GET(self):
         parsed = urlparse(self.path)
         qs = parse_qs(parsed.query)
         path = parsed.path.lstrip("/")
 
-        # Determine channel and playlist type from path
-        # Patterns: {channel}.m3u8, {channel}-video.m3u8, {channel}-audio.m3u8
+        # ── Segment proxy ──────────────────────────────────────────
+        if path == "seg":
+            u = qs.get("u", [None])[0]
+            if not u:
+                self.send_response(400)
+                self.end_headers()
+                return
+            try:
+                data, headers = fetch_url(u)
+                self.send_response(200)
+                ct = headers.get("Content-Type", "video/mp4")
+                self.send_header("Content-Type", ct)
+                self.send_header("Content-Length", str(len(data)))
+                send_cors(self)
+                self.send_header("Cache-Control", "public, max-age=60")
+                self.end_headers()
+                self.wfile.write(data)
+            except Exception as e:
+                self.send_response(502)
+                self.send_header("Content-Type", "text/plain")
+                self.end_headers()
+                self.wfile.write(f"Proxy error: {e}".encode())
+            return
+
+        # ── Playlist ───────────────────────────────────────────────
         playlist_type = "master"
         channel = None
 
@@ -315,10 +334,8 @@ class handler(BaseHTTPRequestHandler):
             self.wfile.write(f"Channel '{channel}' not found.".encode())
             return
 
-        mpd_url = CHANNELS[channel]
-
         try:
-            data, err = get_cached(channel, mpd_url)
+            data, err = get_cached(channel, CHANNELS[channel])
             if err or not data:
                 self.send_response(500)
                 self.send_header("Content-Type", "text/plain")
@@ -336,7 +353,7 @@ class handler(BaseHTTPRequestHandler):
 
             self.send_response(200)
             self.send_header("Content-Type", "application/vnd.apple.mpegurl")
-            self.send_header("Access-Control-Allow-Origin", "*")
+            send_cors(self)
             self.send_header("Cache-Control", "no-cache, no-store, must-revalidate")
             self.end_headers()
             self.wfile.write(content.encode())
