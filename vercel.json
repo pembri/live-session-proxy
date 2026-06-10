@@ -1,12 +1,15 @@
 {
-  "functions": {
-    "api/[channel].js": {
-      "runtime": "edge"
+  "version": 2,
+  "builds": [
+    {
+      "src": "api/proxy.py",
+      "use": "@vercel/python"
     }
-  },
-  "rewrites": [
-    { "source": "/:channel-video.m3u8", "destination": "/api/[channel]?type=video" },
-    { "source": "/:channel-audio.m3u8", "destination": "/api/[channel]?type=audio" },
-    { "source": "/:channel.m3u8", "destination": "/api/[channel]?type=master" }
+  ],
+  "routes": [
+    {
+      "src": "/(indihome|visionplus)/(.+)\\.mpd",
+      "dest": "/api/proxy.py"
+    }
   ]
 }
