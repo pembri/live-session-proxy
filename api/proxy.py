@@ -1,6 +1,5 @@
 import json
 import os
-import requests
 from http.server import BaseHTTPRequestHandler
 
 BASE_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -9,8 +8,7 @@ with open(os.path.join(BASE_DIR, "channels.json")) as f:
 
 class handler(BaseHTTPRequestHandler):
     def do_GET(self):
-        # path: /indihome/gtv.mpd  atau  /visionplus/antv.mpd
-        path = self.path.lstrip("/")
+        path = self.path.lstrip("/").split("?")[0]
         parts = path.split("/")
 
         if len(parts) != 2:
@@ -26,21 +24,10 @@ class handler(BaseHTTPRequestHandler):
 
         origin_url = CHANNELS[cdn_type][slug]
 
-        try:
-            resp = requests.get(origin_url, stream=True, timeout=10, headers={
-                "User-Agent": "Mozilla/5.0",
-                "Referer": "https://www.visionplus.id/" if cdn_type == "visionplus" else ""
-            })
-            self.send_response(resp.status_code)
-            for header in ["Content-Type", "Content-Length", "Cache-Control"]:
-                if header in resp.headers:
-                    self.send_header(header, resp.headers[header])
-            self.send_header("Access-Control-Allow-Origin", "*")
-            self.end_headers()
-            for chunk in resp.iter_content(chunk_size=8192):
-                self.wfile.write(chunk)
-        except Exception as e:
-            self._error(502, str(e))
+        self.send_response(301)
+        self.send_header("Location", origin_url)
+        self.send_header("Access-Control-Allow-Origin", "*")
+        self.end_headers()
 
     def _error(self, code, msg):
         self.send_response(code)
