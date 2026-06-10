@@ -1,7 +1,12 @@
 {
+  "functions": {
+    "api/[channel].js": {
+      "runtime": "edge"
+    }
+  },
   "rewrites": [
-    { "source": "/:channel-video.m3u8", "destination": "/api/[channel]" },
-    { "source": "/:channel-audio.m3u8", "destination": "/api/[channel]" },
-    { "source": "/:channel.m3u8", "destination": "/api/[channel]" }
+    { "source": "/:channel-video.m3u8", "destination": "/api/[channel]?type=video" },
+    { "source": "/:channel-audio.m3u8", "destination": "/api/[channel]?type=audio" },
+    { "source": "/:channel.m3u8", "destination": "/api/[channel]?type=master" }
   ]
 }
