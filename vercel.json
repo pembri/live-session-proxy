@@ -1,8 +1,7 @@
 {
   "rewrites": [
-    { "source": "/seg", "destination": "/api/[channel]" },
-    { "source": "/:channel.m3u8", "destination": "/api/[channel]" },
     { "source": "/:channel-video.m3u8", "destination": "/api/[channel]" },
-    { "source": "/:channel-audio.m3u8", "destination": "/api/[channel]" }
+    { "source": "/:channel-audio.m3u8", "destination": "/api/[channel]" },
+    { "source": "/:channel.m3u8", "destination": "/api/[channel]" }
   ]
 }
