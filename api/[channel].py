@@ -2,7 +2,7 @@ import re
 import time
 import xml.etree.ElementTree as ET
 from http.server import BaseHTTPRequestHandler
-from urllib.parse import urlparse, parse_qs, urlencode, quote
+from urllib.parse import urlparse, parse_qs
 import urllib.request
 
 CHANNELS = {
@@ -112,11 +112,8 @@ CHANNELS = {
 NS = "urn:mpeg:dash:schema:mpd:2011"
 CACHE_TTL = 2
 _cache = {}
-PROXY_BASE = "https://cdn-live-proxy.vidiraplay.biz.id/api/seg"
 
 
-def proxy_url(url):
-    return f"{PROXY_BASE}?u={quote(url, safe='')}"
 
 
 def fetch_url(url):
@@ -165,11 +162,11 @@ def build_media_playlist(init_url, segs, window=6):
         f"#EXT-X-TARGETDURATION:{target}",
         f"#EXT-X-MEDIA-SEQUENCE:{seq}",
         "#EXT-X-INDEPENDENT-SEGMENTS",
-        f'#EXT-X-MAP:URI="{proxy_url(init_url)}"',
+        f'#EXT-X-MAP:URI="{init_url}"',
     ]
     for url, dur, _ in win:
         lines.append(f"#EXTINF:{dur:.5f},")
-        lines.append(proxy_url(url))
+        lines.append(url)
     return "\n".join(lines)
 
 
